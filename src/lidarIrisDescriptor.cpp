@@ -1,4 +1,5 @@
 #include "lidarIrisDescriptor.h"
+#include <memory>
 
 lidar_iris_descriptor::lidar_iris_descriptor(
 	int rows 					= 80,
@@ -57,7 +58,7 @@ std::pair<Eigen::VectorXf, cv::Mat1b> lidar_iris_descriptor::getIris(
 	Eigen::MatrixXf iris_row_key_matrix = Eigen::MatrixXf::Zero(rows_, columns_);
 
 	// extract lidar iris image
-	if(n_scan_ = 6) // livox
+	if(n_scan_ == 6) // livox
 	{
 		for(auto p : cloud.points)
 		{
@@ -126,11 +127,14 @@ inline cv::Mat lidar_iris_descriptor::circRowShift(
 	const cv::Mat &src,
 	int shift_m_rows)
 {
+	if(shift_m_rows != 0)
+	{
+		shift_m_rows %= src.rows;
+	}
 	if(shift_m_rows == 0)
 	{
 		return src.clone();
 	}
-	shift_m_rows %= src.rows;
 	int m = shift_m_rows > 0 ? shift_m_rows : src.rows + shift_m_rows;
 	cv::Mat dst(src.size(), src.type());
 	src(cv::Range(src.rows - m, src.rows), cv::Range::all()).copyTo(dst(cv::Range(0, m), cv::Range::all()));
@@ -142,11 +146,14 @@ inline cv::Mat lidar_iris_descriptor::circColShift(
 	const cv::Mat &src,
 	int shift_n_cols)
 {
+	if(shift_n_cols != 0)
+	{
+		shift_n_cols %= src.cols;
+	}
 	if(shift_n_cols == 0)
 	{
 		return src.clone();
 	}
-	shift_n_cols %= src.cols;
 	int n = shift_n_cols > 0 ? shift_n_cols : src.cols + shift_n_cols;
 	cv::Mat dst(src.size(), src.type());
 	src(cv::Range::all(), cv::Range(src.cols - n, src.cols)).copyTo(dst(cv::Range::all(), cv::Range(0, n)));
@@ -701,8 +708,14 @@ std::pair<int, float> lidar_iris_descriptor::detectIntraLoopClosureID(
 	const int cur_ptr)
 {
 	std::pair<int, float> result {-1, 0.0};
-	Eigen::VectorXf iris_rowkey = iris_rowkeys[id_][cur_ptr]; // current query rowkey
-	lidar_iris_descriptor::featureDesc iris_feature = iris_features[id_][cur_ptr]; // current feature
+	const auto query_rowkey = iris_rowkeys[id_].find(cur_ptr);
+	const auto query_feature = iris_features[id_].find(cur_ptr);
+	if(query_rowkey == iris_rowkeys[id_].end() || query_feature == iris_features[id_].end())
+	{
+		return result;
+	}
+	const Eigen::VectorXf iris_rowkey = query_rowkey->second; // current query rowkey
+	const auto& iris_feature = query_feature->second; // current feature
 
 	if(cur_ptr < exclude_recent_frame_num_ + candidates_num_ + 1)
 	{
@@ -711,56 +724,65 @@ std::pair<int, float> lidar_iris_descriptor::detectIntraLoopClosureID(
 
 	// step 1: candidates from rowkey tree
 	// kd tree construction
-	Eigen::MatrixXf new_iris_rowkeys;
-	// int history_indexes = cur_ptr - exclude_recent_frame_num_;
-	int cur_row = 0;
-	for (auto iris_rowkey : iris_rowkeys[id_])
+	std::vector<int> candidate_ids;
+	candidate_ids.reserve(iris_rowkeys[id_].size());
+	for(const auto& rowkey : iris_rowkeys[id_])
 	{
-		if (iris_rowkey.first > cur_ptr - exclude_recent_frame_num_)
+		if(rowkey.first > cur_ptr - exclude_recent_frame_num_)
 		{
 			continue;
 		}
 
-		new_iris_rowkeys.conservativeResize(rows_, cur_row+1);
-		new_iris_rowkeys.block(0, cur_row, rows_, 1) = iris_rowkey.second.block(0, 0, rows_, 1);
-		cur_row++;
+		candidate_ids.push_back(rowkey.first);
 	}
-	// new_iris_rowkeys.conservativeResize(rows_, history_indexes);
-	// new_iris_rowkeys.block(0, 0, rows_, history_indexes) = iris_rowkeys[id_].block(0, 0, rows_, history_indexes);
-	kdTree = Nabo::NNSearchF::createKDTreeTreeHeap(new_iris_rowkeys, rows_);
+	const int candidate_count = std::min(candidates_num_, int(candidate_ids.size()));
+	if(candidate_count == 0)
+	{
+		return result;
+	}
+	Eigen::MatrixXf new_iris_rowkeys(rows_, candidate_ids.size());
+	for(size_t column = 0; column < candidate_ids.size(); column++)
+	{
+		new_iris_rowkeys.col(column) = iris_rowkeys[id_].at(candidate_ids[column]).col(0);
+	}
+	const std::unique_ptr<Nabo::NNSearchF> kdTree(
+		Nabo::NNSearchF::createKDTreeTreeHeap(new_iris_rowkeys, rows_));
 
 	// search n nearest neighbors
-	Eigen::VectorXi indice(candidates_num_);
-	Eigen::VectorXf distance(candidates_num_);
+	Eigen::VectorXi indice(candidate_count);
+	Eigen::VectorXf distance(candidate_count);
 	float min_distance = 10000000.0;
 	int min_index = -1;
 	int min_bias = 0;
 
 	// knn search
-	kdTree->knn(iris_rowkey, indice, distance, candidates_num_);
+	// The filtered history excludes the query; equal rowkeys are valid neighbors.
+	kdTree->knn(iris_rowkey, indice, distance, candidate_count, 0,
+		Nabo::NNSearchF::ALLOW_SELF_MATCH);
 
 	// step 2: pairwise distance
-	for(int i = 0; i < std::min(candidates_num_, int(indice.size())); i++)
+	for(int i = 0; i < candidate_count; i++)
 	{
-		if(indice[i] >= indexes_maps[id_].size())
+		if(indice[i] < 0 || indice[i] >= int(candidate_ids.size()) || !std::isfinite(distance[i]))
 		{
 			continue;
 		}
 
 		int bias;
-		lidar_iris_descriptor::featureDesc candidate_iris_feature = iris_features[id_][indice[i]];
+		const int candidate_id = candidate_ids[indice[i]];
+		const auto& candidate_iris_feature = iris_features[id_].at(candidate_id);
 		float candidate_distance = compare(iris_feature, candidate_iris_feature, &bias);
 
 		if(candidate_distance < min_distance)
 		{
 			min_distance = candidate_distance;
-			min_index = indice[i];
+			min_index = candidate_id;
 			min_bias = bias;
 		}
 	}
 
 	// threshold check
-	if(min_distance < distance_threshold_)
+	if(min_index >= 0 && min_distance < distance_threshold_)
 	{
 		result.first = min_index;
 		result.second = min_bias;
@@ -779,10 +801,14 @@ std::pair<int, float> lidar_iris_descriptor::detectInterLoopClosureID(
 	const int cur_ptr)
 {
 	std::pair<int, float> result {-1, 0.0};
+	if(cur_ptr < 0 || cur_ptr >= int(iris_feature_index_pairs.size()))
+	{
+		return result;
+	}
 	int robot_id = iris_feature_index_pairs[cur_ptr].first;
 	int frame_id = iris_feature_index_pairs[cur_ptr].second;
-	Eigen::VectorXf iris_rowkey = iris_rowkeys[robot_id][frame_id]; // current query rowkey
-	lidar_iris_descriptor::featureDesc iris_feature = iris_features[robot_id][frame_id]; // current feature
+	const Eigen::VectorXf iris_rowkey = iris_rowkeys[robot_id].at(frame_id); // current query rowkey
+	const auto& iris_feature = iris_features[robot_id].at(frame_id); // current feature
 
 	// step 1: candidates from rowkey tree
 	// kd tree construction
@@ -796,58 +822,48 @@ std::pair<int, float> lidar_iris_descriptor::detectInterLoopClosureID(
 			continue;
 		}
 
-		Eigen::MatrixXf new_iris_rowkeys;
-		std::vector<int> new_indexes_maps;
-		std::vector<lidar_iris_descriptor::featureDesc> new_iris_features;
-
-		if(indexes_maps[i].size() > 0)
+		const int candidate_count = iris_rowkeys[i].size();
+		if(candidate_count > candidates_num_ + 2)
 		{
-			for (auto iris_rowkey : iris_rowkeys[i])
+			Eigen::MatrixXf new_iris_rowkeys(rows_, candidate_count);
+			std::vector<int> candidate_ids;
+			candidate_ids.reserve(candidate_count);
+			// Each KD column and its descriptor/global index share the same key.
+			for(const auto& rowkey : iris_rowkeys[i])
 			{
-				int cur_row = new_iris_rowkeys.cols();
-				new_iris_rowkeys.conservativeResize(rows_, cur_row + 1);
-				new_iris_rowkeys.block(0, cur_row, rows_, 1) = iris_rowkey.second.block(0, 0, rows_, 1);
+				new_iris_rowkeys.col(candidate_ids.size()) = rowkey.second.col(0);
+				candidate_ids.push_back(rowkey.first);
 			}
-
-			for (auto indexes_map : indexes_maps[i])
-			{
-				new_indexes_maps.emplace_back(indexes_map.second);
-			}
-
-			for (auto iris_feature : iris_features[i])
-			{
-				new_iris_features.emplace_back(iris_feature.second);
-			}
-		}
-
-		if(new_indexes_maps.size() > candidates_num_ + 2)
-		{
-			kdTree = Nabo::NNSearchF::createKDTreeLinearHeap(new_iris_rowkeys, rows_);
+			const std::unique_ptr<Nabo::NNSearchF> kdTree(
+				Nabo::NNSearchF::createKDTreeLinearHeap(new_iris_rowkeys, rows_));
 
 			// search n nearest neighbors
 			Eigen::VectorXi indice(candidates_num_);
 			Eigen::VectorXf distance(candidates_num_);
 
 			// knn search
-			kdTree->knn(iris_rowkey, indice, distance, candidates_num_);
+			// The pool contains only other robots, so equal rowkeys are not self matches.
+			kdTree->knn(iris_rowkey, indice, distance, candidates_num_, 0,
+				Nabo::NNSearchF::ALLOW_SELF_MATCH);
 
 			// step 2: pairwise distance
 			// #pragma omp parallel for num_threads(4)
-			for(int i = 0; i < std::min(candidates_num_, int(indice.size())); i++)
+			for(int candidate = 0; candidate < candidates_num_; candidate++)
 			{
-				if(indice[i] >= new_indexes_maps.size())
+				if(indice[candidate] < 0 || indice[candidate] >= candidate_count || !std::isfinite(distance[candidate]))
 				{
 					continue;
 				}
 
 				int bias;
-				lidar_iris_descriptor::featureDesc candidate_iris_feature = new_iris_features[indice[i]];
+				const int candidate_id = candidate_ids[indice[candidate]];
+				const auto& candidate_iris_feature = iris_features[i].at(candidate_id);
 				float candidate_distance = compare(iris_feature, candidate_iris_feature, &bias);
 
 				if(candidate_distance < min_distance)
 				{
 					min_distance = candidate_distance;
-					min_index = new_indexes_maps[indice[i]];
+					min_index = indexes_maps[i].at(candidate_id);
 					min_bias = bias;
 				}
 			}
@@ -855,7 +871,7 @@ std::pair<int, float> lidar_iris_descriptor::detectInterLoopClosureID(
 	}
 
 	// threshold check
-	if(min_distance < distance_threshold_)
+	if(min_index >= 0 && min_distance < distance_threshold_)
 	{
 		result.first = min_index;
 		result.second = min_bias;
@@ -865,9 +881,8 @@ std::pair<int, float> lidar_iris_descriptor::detectInterLoopClosureID(
 	}
 	else
 	{
-		ROS_DEBUG("\033[1;33m[Iris Inter Not loop<%d>] btn %d-%d and %d-%d. Dis: %.2f. Bias:%d\033[0m", id_,
-			iris_feature_index_pairs[cur_ptr].first, iris_feature_index_pairs[cur_ptr].second,
-			iris_feature_index_pairs[min_index].first, iris_feature_index_pairs[min_index].second, min_distance, min_bias);
+		ROS_DEBUG("\033[1;33m[Iris Inter Not loop<%d>] btn %d-%d and global index %d. Dis: %.2f. Bias:%d\033[0m", id_,
+			robot_id, frame_id, min_index, min_distance, min_bias);
 	}
 	return result;
 }

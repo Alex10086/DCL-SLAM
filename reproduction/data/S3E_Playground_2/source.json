@@ -1,0 +1,16 @@
+{
+  "dataset": "S3E",
+  "version": "S3Ev1",
+  "sequence": "S3E_Playground_2",
+  "publisher": "PengYu-Team",
+  "project_url": "https://pengyu-team.github.io/S3E/",
+  "source_url": "https://huggingface.co/datasets/PengYu-Team/S3E/resolve/dd2d0dccb95985468800ed858a5418005ce75cd3/S3Ev1/S3E_Playground_2/S3E_Playground_2.db3",
+  "revision": "dd2d0dccb95985468800ed858a5418005ce75cd3",
+  "expected_bytes": 6732963840,
+  "expected_sha256": "fa2bceb5064fa50318452fba247f49971b4119f3bf6af686629b30a265d1b095",
+  "source_duration_ns": 222845499512,
+  "robots": {"Alpha": "a", "Bob": "b", "Carol": "c"},
+  "selection": "Smallest S3Ev1 DB3 in publisher API listing. All three published ground-truth trajectories have nonzero independent motion.",
+  "legacy_ros1_search": "Upstream README and original S3E README direct to publisher website; current website and IEEE DataPort list ROS2 only. IEEE DataPort has no uploaded files. No accessible authentic legacy ROS1 bag found.",
+  "license_reference": "https://ieee-dataport.org/documents/s3e-multi-robot-multimodal-dataset-collaborative-slam (CC BY 4.0)"
+}

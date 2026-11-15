@@ -122,9 +122,12 @@ class lidar_iris_descriptor : public scan_descriptor
 			const int8_t robot,
 			const int index);
 
+		// Returns the local keyframe ID and query-to-candidate column shift.
 		std::pair<int, float> detectIntraLoopClosureID(
 			const int cur_ptr);
 
+		// Returns the global descriptor ID and query-to-candidate shift
+		// (degrees for the configured 360 one-degree columns).
 		std::pair<int, float> detectInterLoopClosureID(
 			const int cur_ptr);
 
@@ -145,9 +148,6 @@ class lidar_iris_descriptor : public scan_descriptor
 		int exclude_recent_frame_num_;
 		int match_mode_;
 		int candidates_num_;
-
-		// kd tree
-		Nabo::NNSearchF* kdTree = NULL;
 
 		// descriptor params
 		int nscale_;

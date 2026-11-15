@@ -87,5 +87,6 @@ add_library(dcl_slam
   src/scanContextDescriptor.cpp
   src/lidarIrisDescriptor.cpp
   src/m2dpDescriptor.cpp)
+add_dependencies(dcl_slam ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(dcl_slam ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${libnabo_LIBRARIES})
 

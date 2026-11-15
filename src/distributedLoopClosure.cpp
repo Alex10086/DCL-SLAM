@@ -326,18 +326,17 @@ void distributedMapping::performInterLoopClosure()
 	}
 
 	// Place Recognition: find candidates with global descriptor
-	auto matching_result = keyframe_descriptor->detectInterLoopClosureID(inter_robot_loop_ptr);
-	int loop_robot0 = keyframe_descriptor->getIndex(inter_robot_loop_ptr).first;
-	int loop_robot1 = keyframe_descriptor->getIndex(matching_result.first).first;
-	int loop_key0 = keyframe_descriptor->getIndex(inter_robot_loop_ptr).second;
-	int loop_key1 = keyframe_descriptor->getIndex(matching_result.first).second;
-	float init_yaw = matching_result.second;
-	inter_robot_loop_ptr++;
-
+	const int descriptor_index = inter_robot_loop_ptr++;
+	auto matching_result = keyframe_descriptor->detectInterLoopClosureID(descriptor_index);
 	if(matching_result.first < 0) // no loop found
 	{
 		return;
 	}
+	int loop_robot0 = keyframe_descriptor->getIndex(descriptor_index).first;
+	int loop_robot1 = keyframe_descriptor->getIndex(matching_result.first).first;
+	int loop_key0 = keyframe_descriptor->getIndex(descriptor_index).second;
+	int loop_key1 = keyframe_descriptor->getIndex(matching_result.first).second;
+	float init_yaw = matching_result.second;
 
 	LOG(INFO) << "[InterLoop<" << id_ << ">] found between ["
 		<< loop_robot0 << "]-[" << loop_key0 << "][" << inter_robot_loop_ptr-1 << "] and ["
@@ -387,8 +386,10 @@ void distributedMapping::performExternLoopClosure()
 	// check the loop closure if added before
 	auto find_key_indexes0 = loop_indexes.find(loop_symbol0);
 	auto find_key_indexes1 = loop_indexes.find(loop_symbol1);
-	if (find_key_indexes0->second.chr() == loop_symbol1.chr() ||
-		find_key_indexes1->second.chr() == loop_symbol0.chr())
+	if ((find_key_indexes0 != loop_indexes.end() &&
+		find_key_indexes0->second.chr() == loop_symbol1.chr()) ||
+		(find_key_indexes1 != loop_indexes.end() &&
+		find_key_indexes1->second.chr() == loop_symbol0.chr()))
 	{
 		ROS_DEBUG("\033[1;33m[LoopClosure] Loop has added. Skip.\033[0m");
 		return;
@@ -408,15 +409,8 @@ void distributedMapping::performExternLoopClosure()
 	
 	// get initial pose
 	CHECK_LT(inter_loop.index1, initial_values->size());
-	double initial_yaw_;
-	if (descriptor_type_num_ == DescriptorType::LidarIris)
-	{
-		initial_yaw_ = (inter_loop.init_yaw+1)*2*M_PI/60.0;
-	}
-	else
-	{
-		initial_yaw_ = inter_loop.init_yaw*M_PI/180.0;
-	}
+	// LidarIris returns a shift in its 360 one-degree columns.
+	double initial_yaw_ = inter_loop.init_yaw*M_PI/180.0;
 	if(initial_yaw_ > M_PI)
 		initial_yaw_ -= 2*M_PI;
 	
@@ -684,6 +678,7 @@ void distributedMapping::loopClosureThread()
 	while(ros::ok())
 	{
 		rate.sleep();
+		std::lock_guard<std::mutex> graph_lock(lock_on_call);
 
 		performRSIntraLoopClosure(); // find intra-loop with radius search
 

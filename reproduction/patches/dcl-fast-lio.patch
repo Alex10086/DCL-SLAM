@@ -1,0 +1,67 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0d40766..516fa1d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -56,7 +56,6 @@ find_package(catkin REQUIRED COMPONENTS
+   message_generation
+   eigen_conversions
+   gtsam_catkin
+-  pcl_catkin
+   glog_catkin
+   distributed_mapper_catkin
+   dcl_slam
+@@ -101,5 +100,6 @@ catkin_package(
+ )
+ 
+ add_executable(fastlio_mapping src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
++add_dependencies(fastlio_mapping ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+ target_link_libraries(fastlio_mapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${PYTHON_LIBRARIES} ${libnabo_LIBRARIES})
+ target_include_directories(fastlio_mapping PRIVATE ${PYTHON_INCLUDE_DIRS})
+\ No newline at end of file
+diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
+index a80b569..a9b8c23 100644
+--- a/src/laserMapping.cpp
++++ b/src/laserMapping.cpp
+@@ -50,6 +50,7 @@
+ #include <pcl_conversions/pcl_conversions.h>
+ #include <pcl/point_cloud.h>
+ #include <pcl/point_types.h>
++#include <pcl/common/transforms.h>
+ #include <pcl/filters/voxel_grid.h>
+ #include <pcl/io/pcd_io.h>
+ #include <sensor_msgs/PointCloud2.h>
+@@ -893,11 +894,13 @@ int main(int argc, char** argv)
+             ("path", 100000);
+ //------------------------------------------------------------------------------------------------------
+     signal(SIGINT, SigHandle);
+-    ros::Rate rate(5000);
++    // Buffered sensor data must keep processing when rosbag pauses its clock.
++    ros::WallRate rate(1000);
+     bool status = ros::ok();
+     while (status)
+     {
+         if (flg_exit) break;
++        std::unique_lock<std::mutex> graph_lock(dm.lock_on_call);
+         ros::spinOnce();
+         if(sync_packages(Measures)) 
+         {
+@@ -1012,6 +1015,11 @@ int main(int argc, char** argv)
+                 // keyframe
+                 pcl::PointCloud<pcl::PointXYZI>::Ptr keyframe(new pcl::PointCloud<pcl::PointXYZI>());
+                 pcl::copyPointCloud(*feats_undistort, *keyframe);
++                // The pose graph stores IMU poses, so keyframes must use IMU coordinates.
++                Eigen::Affine3f lidar_to_imu = Eigen::Affine3f::Identity();
++                lidar_to_imu.linear() = state_point.offset_R_L_I.toRotationMatrix().cast<float>();
++                lidar_to_imu.translation() = state_point.offset_T_L_I.cast<float>();
++                pcl::transformPointCloud(*keyframe, *keyframe, lidar_to_imu);
+ 
+                 dm.performDistributedMapping(pose_to, keyframe, ros::Time().fromSec(lidar_end_time));
+ 
+@@ -1121,6 +1129,7 @@ int main(int argc, char** argv)
+         }
+ 
+         status = ros::ok();
++        graph_lock.unlock();
+         rate.sleep();
+     }
+ 

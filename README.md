@@ -37,7 +37,7 @@ The HD video of the demonstration of DCL-SLAM is avaliable at [BiliBili](https:/
   Then use wstool for fetching catkin dependencies:
   ```
   cd src
-  git clone https://github.com/zhongshp/DCL-SLAM.git
+  git clone https://github.com/Alex10086/DCL-SLAM.git
   git clone https://github.com/zhongshp/DCL-LIO-SAM.git
   git clone https://github.com/zhongshp/DCL-FAST-LIO.git
   wstool init
@@ -59,6 +59,66 @@ The HD video of the demonstration of DCL-SLAM is avaliable at [BiliBili](https:/
   ```
   
   - Other dataset. Please follow [LIO-SAM](https://github.com/TixiaoShan/LIO-SAM) and [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) to set your own config file for the dataset in "config/*your-config-file*.yaml", and change the path in "launch/single_ugv.launch".
+
+### Local Jetson4 Docker reproduction
+
+This fork is maintained at https://github.com/Alex10086/DCL-SLAM with
+https://github.com/zhongshp/DCL-SLAM retained as the upstream project.
+The isolated workspace is `~/dcl_slam_docker`; the ARM64 Ubuntu 20.04 /
+ROS Noetic container is `dcl-slam-noetic`. The host ROS 2 Jazzy is unchanged.
+The reproduction uses the supported FAST-LIO2 frontend (`lioType=2`).
+
+**Status:** three-robot short-sequence acceptance has not passed yet.
+The latest backend-finalization change received Python syntax checking only.
+No additional tests or replays were started after the request to fix and fork.
+Earlier runs proved full sensor coverage and A/B optimization, not complete
+three-robot fusion. Historical measurements and patch status are recorded in
+`reproduction/versions.json`; do not describe these changes as runtime-verified.
+
+`reproduction/` contains the Docker scripts, conversion tools, published
+calibration overlays, pinned source manifest, and companion repository patches.
+These assets use the isolated workspace layout rather than the catkin package root:
+
+```bash
+workspace="$HOME/dcl_slam_docker"
+cp -a reproduction/. "$workspace/"
+git -C "$workspace/ws/src/DCL-FAST-LIO" apply "$workspace/patches/dcl-fast-lio.patch"
+git -C "$workspace/ws/src/gtsam_catkin" apply "$workspace/patches/gtsam-catkin.patch"
+```
+
+Apply patches only to the clean revisions listed in the manifest. They are
+already applied in the existing Jetson workspace and must not be applied twice.
+Build with `bash "$workspace/docker/build-workspace.sh"`. Creating this fork does
+not build, start, or test the environment.
+
+When testing is explicitly resumed, use only the prepared 121-second prefix:
+
+```bash
+sudo docker exec dcl-slam-noetic bash -c 'source /ws/devel/setup.bash; python3 /repro/run-dataset.py /results/loop_diagnosis/prefix121.bag --output /results/short_$(date +%Y%m%d_%H%M%S)'
+```
+
+The runner uses actual slowest-stream odometry for rosbag feedback limiting.
+Native `--keep-alive` continues only `/clock` after the last recorded sensor input,
+allowing queued loop detection and optimization to finish. It stops only after
+input coverage, a connected A/B/C loop graph, completed optimization for all three,
+and fresh maps; backend finalization is bounded by `--drain-timeout` (600 wall seconds).
+No later sensor data is added. `validate_results.py` applies the same criteria to
+live progress and saved output.
+
+The coarse rowkey candidate width is 40 instead of 6: timestamp-aligned saved
+queries placed valid C candidates at ranks 13-35. ICP, RANSAC, Hamming and PCM
+acceptance thresholds were not relaxed. Necessary source corrections also cover
+KD-column/keyframe correspondence, aligned descriptor lookup, scoped KD trees,
+missing-neighbor handling, descriptor yaw units, periodic image shifts, IMU-frame
+keyframes, and synchronized graph access.
+
+The original [S3E dataset](https://pengyu-team.github.io/S3E/) is retained outside
+Git. Conversion uses uncompressed ROS 1 chunks and preserves measured firing times.
+Calibration overlays are derived from the publisher's S3Ev1 camera-chain files.
+PCM requires `$HOME/dcl_output`, created by `docker/start-container.sh`.
+TUM trajectories, PCD map views and recorded output bags remain local; map views
+are not a complete dense map. Datasets, build products, credentials and experiment
+logs are not included in this fork.
 
 ## Citation
 This work is published in IEEE Sensors Journal 2023, and please cite related papers:

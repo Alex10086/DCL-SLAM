@@ -1,0 +1,7 @@
+ws/
+results/
+tools/venv/
+**/__pycache__/
+data/**/*.bag
+data/**/*.db3
+data/**/*.db3-*

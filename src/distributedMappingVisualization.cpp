@@ -10,6 +10,7 @@ void distributedMapping::globalMapThread()
 	while(ros::ok())
 	{
 		rate.sleep();
+		std::lock_guard<std::mutex> graph_lock(lock_on_call);
 
 		publishGlobalMap(); // global map visualization
 

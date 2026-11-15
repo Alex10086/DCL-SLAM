@@ -1,0 +1,25 @@
+<launch>
+  <param name="use_sim_time" value="true"/>
+  <param name="number_of_robots" value="3"/>
+  <env name="OMP_NUM_THREADS" value="2"/>
+  <include file="$(find dcl_slam)/launch/single_ugv.launch">
+    <arg name="robotPrefix" value="a"/>
+    <arg name="lioType" value="2"/>
+  </include>
+  <include file="$(find dcl_slam)/launch/single_ugv.launch">
+    <arg name="robotPrefix" value="b"/>
+    <arg name="lioType" value="2"/>
+  </include>
+  <include file="$(find dcl_slam)/launch/single_ugv.launch">
+    <arg name="robotPrefix" value="c"/>
+    <arg name="lioType" value="2"/>
+  </include>
+  <rosparam file="/data/s3e_fast_calibration.yaml" command="load"/>
+  <!-- Keep valid C matches ranked 13-35 by the coarse rowkey search. -->
+  <param name="a/dcl_slam/knn_candidates" value="40"/>
+  <param name="b/dcl_slam/knn_candidates" value="40"/>
+  <param name="c/dcl_slam/knn_candidates" value="40"/>
+  <param name="a/dcl_slam/onboard_cpu_cores_num" value="2"/>
+  <param name="b/dcl_slam/onboard_cpu_cores_num" value="2"/>
+  <param name="c/dcl_slam/onboard_cpu_cores_num" value="2"/>
+</launch>
