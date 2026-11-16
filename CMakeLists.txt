@@ -32,6 +32,7 @@ add_message_files(
   loop_info.msg
   global_descriptor.msg
   neighbor_estimate.msg
+  optimization_state.msg
 )
 
 generate_messages(
@@ -90,3 +91,8 @@ add_library(dcl_slam
 add_dependencies(dcl_slam ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(dcl_slam ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBRARIES} ${OpenMP_CXX_FLAGS} ${libnabo_LIBRARIES})
 
+
+# Explicit regression target: no sensor input or ROS master required.
+add_executable(dcl_round_protocol_test EXCLUDE_FROM_ALL reproduction/tests/round_protocol_test.cpp)
+add_dependencies(dcl_round_protocol_test ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(dcl_round_protocol_test ${catkin_LIBRARIES})

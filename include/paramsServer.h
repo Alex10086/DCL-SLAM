@@ -41,9 +41,9 @@ struct singleRobot {
 
 	/*** ros subscriber and publisher ***/
 	// mapping
-	ros::Subscriber sub_optimization_state, sub_pose_estimate_state, sub_rotation_estimate_state;
+	ros::Subscriber sub_optimization_state;
 	ros::Subscriber sub_neighbor_rotation_estimates, sub_neighbor_pose_estimates;
-	ros::Publisher pub_optimization_state, pub_pose_estimate_state, pub_rotation_estimate_state;
+	ros::Publisher pub_optimization_state;
 	ros::Publisher pub_neighbor_rotation_estimates, pub_neighbor_pose_estimates;
 	// loop closure
 	ros::Subscriber sub_loop_info;

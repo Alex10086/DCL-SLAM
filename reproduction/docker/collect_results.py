@@ -12,8 +12,7 @@ import rospy
 from nav_msgs.msg import Odometry, Path as RosPath
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs import point_cloud2
-from std_msgs.msg import Int8
-from dcl_slam.msg import global_descriptor, loop_info
+from dcl_slam.msg import global_descriptor, loop_info, optimization_state
 
 parser = argparse.ArgumentParser()
 parser.add_argument('output', type=Path)
@@ -28,6 +27,47 @@ optimizer_states = {r: set() for r in 'abc'}
 accepted_loops = set()
 nonfinite = collections.Counter()
 latest_odometry = {}
+optimization_rounds = {}
+map_timing = {}
+
+
+def record_round(robot, msg, observed_at):
+    optimizer_states[robot].add(msg.state)
+    if not msg.round_id:
+        return
+    key = str(msg.round_id)
+    evidence = optimization_rounds.setdefault(key, {'robots': {}, 'aborted': False})
+    previous = evidence['robots'].get(robot, {})
+    status = {name: getattr(msg, name) for name in
+              ('round_id', 'coordinator', 'state', 'committed', 'aborted',
+               'rotation_done', 'pose_done')}
+    status.update(participants=sorted(msg.participants), order=list(msg.order),
+                  separator_keys=list(msg.separator_keys),
+                  proposal_keys=list(msg.proposal_keys), observed_at=observed_at)
+    # PREPARE/READY legitimately have no order and locally proposed edges.
+    # Freeze metadata only when COMMIT first supplies the common plan.
+    committed_metadata = previous.get('committed_metadata')
+    metadata = {name: status[name] for name in
+                ('coordinator', 'participants', 'order', 'separator_keys')}
+    status['metadata_mismatch'] = previous.get('metadata_mismatch', False) or (
+        committed_metadata is not None and metadata != committed_metadata)
+    status['committed_metadata'] = (
+        committed_metadata if committed_metadata is not None else
+        metadata if status['committed'] else None)
+    status['aborted'] = status['aborted'] or previous.get('aborted', False)
+    evidence['aborted'] = evidence['aborted'] or status['aborted']
+    status['completed_state'] = previous.get('completed_state')
+    status['completed_observed_at'] = previous.get('completed_observed_at')
+    status['completed_rotation_done'] = previous.get('completed_rotation_done', False)
+    status['completed_pose_done'] = previous.get('completed_pose_done', False)
+    if msg.state == 6 and status['completed_observed_at'] is None:
+        status.update(completed_state=6, completed_observed_at=observed_at,
+                      completed_rotation_done=msg.rotation_done,
+                      completed_pose_done=msg.pose_done)
+    evidence['robots'][robot] = status
+    # Walltime-generated IDs order rounds, unlike paused/replayed ROS time.
+    for old in sorted(optimization_rounds, key=int)[:-32]:
+        del optimization_rounds[old]
 
 
 def callback(msg, key):
@@ -48,10 +88,12 @@ def callback(msg, key):
                                                    key=lambda odom: odom.header.stamp.to_nsec()))
         elif kind == 'globalMap':
             last_maps[robot] = msg
+            map_timing[robot] = {'map_received_at': rospy.Time.now().to_sec(),
+                                 'map_header_stamp': msg.header.stamp.to_sec()}
         elif kind == 'path':
             path_sizes[robot] = len(msg.poses)
         elif kind == 'optimizationState':
-            optimizer_states[robot].add(msg.data)
+            record_round(robot, msg, rospy.Time.now().to_sec())
         elif kind == 'loopInfo' and msg.robot0 != msg.robot1 and msg.noise < 888:
             accepted_loops.add((msg.robot0, msg.index0, msg.robot1, msg.index1))
 
@@ -62,6 +104,7 @@ def save_progress(_event):
             'clock': rospy.Time.now().to_sec(),
             'message_counts': dict(counts),
             'optimizer_states': {r: sorted(s) for r, s in optimizer_states.items()},
+            'optimization_rounds': optimization_rounds,
             'accepted_inter_robot_loops': [list(edge) for edge in sorted(accepted_loops)],
             'nonfinite_odometry': dict(nonfinite),
             'robots': {},
@@ -70,11 +113,13 @@ def save_progress(_event):
             cloud = last_maps.get(robot)
             stats = {'odometry_samples': len(rows),
                      'map_points': cloud.width * cloud.height if cloud is not None else 0}
+            stats.update(map_timing.get(robot, {}))
             if rows:
                 stats.update(first_stamp=rows[0][0], last_stamp=rows[-1][0])
             snapshot['robots'][robot] = stats
+        serialized = json.dumps(snapshot)
     temporary = args.output / 'progress.json.tmp'
-    temporary.write_text(json.dumps(snapshot))
+    temporary.write_text(serialized)
     temporary.replace(args.output / 'progress.json')
 
 
@@ -88,7 +133,7 @@ for robot in 'abc':
         ('path', RosPath, 'distributedMapping/path'),
         ('globalDescriptors', global_descriptor, 'distributedMapping/globalDescriptors'),
         ('loopInfo', loop_info, 'distributedMapping/loopInfo'),
-        ('optimizationState', Int8, 'distributedMapping/optimizationState'),
+        ('optimizationState', optimization_state, 'distributedMapping/optimizationState'),
     ]:
         subscriptions.append(rospy.Subscriber('/' + robot + '/' + suffix, msg_type,
                                               callback, (robot, kind), queue_size=100,
@@ -101,12 +146,14 @@ finally:
     with lock:
         report = {'message_counts': dict(counts), 'path_sizes': path_sizes,
                   'optimizer_states': {r: sorted(s) for r, s in optimizer_states.items()},
+                  'optimization_rounds': optimization_rounds,
                   'accepted_inter_robot_loops': [list(x) for x in sorted(accepted_loops)],
                   'nonfinite_odometry': dict(nonfinite), 'robots': {}}
         for robot, rows in trajectories.items():
             np.savetxt(str(args.output / (robot + '_trajectory.tum')), np.asarray(rows), fmt='%.9f')
             points = np.asarray(rows)
             info = {'odometry_samples': len(rows)}
+            info.update(map_timing.get(robot, {}))
             if len(rows):
                 xyz = points[:, 1:4]
                 info.update(first_stamp=float(points[0, 0]), last_stamp=float(points[-1, 0]),

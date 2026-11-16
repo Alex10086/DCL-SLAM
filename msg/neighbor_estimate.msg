@@ -1,5 +1,7 @@
 # estimate
 Header header
+uint64 round_id
+uint32 iteration
 
 int8 receiver_id
 int8 estimation_done

@@ -78,7 +78,6 @@ try:
                           '--rate-control-topic=/dcl_replay/progress',
                           '--rate-control-max-delay=5.0', args.bag])
     drain_deadline = None
-    map_counts_at_completion = None
     pending_reason = 'Waiting for the last sensor input'
     while True:
         try:
@@ -112,12 +111,9 @@ try:
         except RuntimeError as error:
             pending_reason = str(error)
         else:
-            current_maps = {r: progress['message_counts'].get(r + '/globalMap', 0) for r in 'abc'}
-            if map_counts_at_completion is None:
-                map_counts_at_completion = current_maps
-            elif all(current_maps[r] > map_counts_at_completion[r] for r in 'abc'):
-                break
-            pending_reason = 'Waiting for fresh maps after three-robot optimization'
+            # validate_snapshot uses actual ROS-clock map reception after the
+            # newest coherent completion, identically for live and final data.
+            break
         if time.monotonic() > drain_deadline:
             raise RuntimeError('Backend did not finish the recorded input: ' + pending_reason)
 finally:

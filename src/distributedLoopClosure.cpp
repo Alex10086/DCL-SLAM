@@ -65,6 +65,7 @@ void distributedMapping::loopInfoHandler(
 		Pose3 pose_between = transformToGtsamPose(msg->pose_between);
 		NonlinearFactor::shared_ptr factor(new BetweenFactor<Pose3>(
 			Symbol('a'+msg->robot0, msg->index0), Symbol('a'+msg->robot1, msg->index1), pose_between, loop_noise));
+		recordInterLoop(Symbol('a'+msg->robot0, msg->index0), Symbol('a'+msg->robot1, msg->index1));
 		
 		// update adjacency matrix
 		adjacency_matrix(msg->robot0, msg->robot1) += 1;
@@ -561,6 +562,7 @@ void distributedMapping::performExternLoopClosure()
 		Symbol('a'+inter_loop.robot0, inter_loop.index0),
 		Symbol('a'+inter_loop.robot1, inter_loop.index1),
 		pose_between, loop_noise));
+	recordInterLoop(Symbol('a'+inter_loop.robot0, inter_loop.index0), Symbol('a'+inter_loop.robot1, inter_loop.index1));
 	adjacency_matrix(inter_loop.robot1, inter_loop.robot0) += 1;
 	adjacency_matrix(inter_loop.robot0, inter_loop.robot1) += 1;
 	local_pose_graph->add(factor);
@@ -572,10 +574,10 @@ void distributedMapping::performExternLoopClosure()
 	graph_utils::PoseWithCovariance pose;
 	pose.covariance_matrix = loop_noise->covariance();
 	pose.pose = transformToGtsamPose(inter_loop.pose1);
-	key = loop_symbol1.key();
+	key = Symbol('a'+inter_loop.robot1, inter_loop.index1).key();
 	updatePoseEstimateFromNeighbor(inter_loop.robot1, key, pose);
 	pose.pose = transformToGtsamPose(inter_loop.pose0);
-	key = loop_symbol0.key();
+	key = Symbol('a'+inter_loop.robot0, inter_loop.index0).key();
 	updatePoseEstimateFromNeighbor(inter_loop.robot0, key, pose);
 
 	// add transform to local map (for PCM)
@@ -678,14 +680,14 @@ void distributedMapping::loopClosureThread()
 	while(ros::ok())
 	{
 		rate.sleep();
-		std::lock_guard<std::mutex> graph_lock(lock_on_call);
-
-		performRSIntraLoopClosure(); // find intra-loop with radius search
-
-		performIntraLoopClosure(); // find intra-loop with descriptor
-
-		performInterLoopClosure(); // find inter-loop with descriptor
-
-		performExternLoopClosure(); // verify all inter-loop here
+		{
+			std::lock_guard<std::mutex> graph_lock(lock_on_call);
+			performRSIntraLoopClosure();
+			performIntraLoopClosure();
+			performInterLoopClosure();
+			performExternLoopClosure();
+		}
+		// ROS Rate may not sleep after an overrun. Let waiting callbacks acquire the lock.
+		ros::WallDuration(0.001).sleep();
 	}
 }

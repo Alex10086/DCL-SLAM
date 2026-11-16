@@ -100,17 +100,58 @@ sudo docker exec dcl-slam-noetic bash -c 'source /ws/devel/setup.bash; python3 /
 The runner uses actual slowest-stream odometry for rosbag feedback limiting.
 Native `--keep-alive` continues only `/clock` after the last recorded sensor input,
 allowing queued loop detection and optimization to finish. It stops only after
-input coverage, a connected A/B/C loop graph, completed optimization for all three,
-and fresh maps; backend finalization is bounded by `--drain-timeout` (600 wall seconds).
-No later sensor data is added. `validate_results.py` applies the same criteria to
-live progress and saved output.
+input coverage, a connected A/B/C loop graph, and a committed, nonaborted
+optimization round with identical coordinator, participants (0,1,2), order,
+and committed PCM separator edges reported by all three robots. The committed
+separator graph must itself connect all three; pre-PCM loop connectivity alone
+is insufficient. Actual End (6), with both rotation and pose stages done, is
+retained through later Idle/PostEnd statuses; historical A/B completion cannot
+combine with a newer C
+completion, and a newer incomplete or aborted round blocks older success.
+Every map must be received after the joint completion observation (ROS clock),
+not merely carry an old keyframe header stamp. Backend finalization is bounded
+by `--drain-timeout` (600 wall seconds); no later sensor data is added.
+`validate_results.py` applies identical live/final criteria. Both `progress.json`
+and `summary.json` save numeric state history, the newest 32 rounds with per-robot
+metadata, latest status, latched abort/completion evidence and receiver times,
+plus separate map reception and header times.
+
+The lowest-ID coordinator drives PREPARE/READY/COMMIT: each participant freezes
+its own graph/values and runs unchanged local PCM, then the coordinator intersects
+endpoint acceptance, checks connectivity and commits a common connected greedy
+order. All participants acknowledge before rotation starts. Each round uses a
+fresh optimizer; round/iteration-tagged incremental Gauss-Seidel retains early
+estimates, requires final rotation payloads before pose conversion, and distributes
+the final anchor even to non-neighbors. Aborts propagate without shrinking the
+participant set. `dcl_slam/optimization_round_timeout` defaults to 120 wall seconds
+without semantic progress. The loop worker releases its shared lock and yields
+1 ms after each batch to let callbacks run even when ROS Rate overruns.
+
+**Rebuild required:** `optimizationState` now uses `dcl_slam/optimization_state`,
+not `std_msgs/Int8`, with round metadata, proposal/committed separator keys and
+stage flags. Neighbor estimates carry round/iteration IDs; the separate
+`rotationEstimateState`/`poseEstimateState` topics are removed. Rebuild the whole
+workspace and every frontend/custom-message caller together; old binaries and
+Int8 subscribers are incompatible. No PCM/ICP thresholds or solver mathematics
+are relaxed by this round protocol.
+
+After rebuilding, run the focused checks:
+
+```bash
+sudo docker exec dcl-slam-noetic bash -c 'source /ws/devel/setup.bash; cmake --build /ws/build/dcl_slam --target dcl_round_protocol_test && /ws/devel/lib/dcl_slam/dcl_round_protocol_test'
+sudo docker exec dcl-slam-noetic bash -c 'source /ws/devel/setup.bash; python3 -m unittest discover -s /ws/src/DCL-SLAM/reproduction/tests -p test_validate_results.py -v'
+```
+
+The C++ regression lives in `reproduction/tests/round_protocol_test.cpp`; Python
+tests exercise real live/final snapshot validation without starting ROS nodes.
 
 The coarse rowkey candidate width is 40 instead of 6: timestamp-aligned saved
 queries placed valid C candidates at ranks 13-35. ICP, RANSAC, Hamming and PCM
 acceptance thresholds were not relaxed. Necessary source corrections also cover
 KD-column/keyframe correspondence, aligned descriptor lookup, scoped KD trees,
 missing-neighbor handling, descriptor yaw units, periodic image shifts, IMU-frame
-keyframes, and synchronized graph access.
+keyframes, synchronized graph access, post-reordering PCM trajectory keys, and
+sequential-odometry merging after a frozen round.
 
 The original [S3E dataset](https://pengyu-team.github.io/S3E/) is retained outside
 Git. Conversion uses uncompressed ROS 1 chunks and preserves measured firing times.

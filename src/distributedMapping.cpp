@@ -1,4 +1,5 @@
 #include "distributedMapping.h"
+#include <cmath>
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * 
 	class distributedMapping: handle message callback 
@@ -19,303 +20,158 @@ void distributedMapping::globalDescriptorHandler(
 }
 
 void distributedMapping::optStateHandler(
-	const std_msgs::Int8ConstPtr& msg,
-	int& id)
+	const dcl_slam::optimization_stateConstPtr& msg, int& id)
 {
-	neighbors_started_optimization[id] = (OptimizerState)msg->data <= OptimizerState::Start;
-	neighbor_state[id] = (OptimizerState)msg->data;
-	neighbors_lowest_id_included[id] = lowest_id_included;
-	if(neighbors_within_communication_range.find(id) == neighbors_within_communication_range.end())
+	if(!dcl_slam::OptimizationRound::valid(*msg, number_of_robots_) ||
+		!dcl_slam::OptimizationRound::contains(msg->participants, id_) ||
+		!dcl_slam::OptimizationRound::contains(msg->participants, id))
+		return;
+	if(msg->round_id > round.status.round_id && id == msg->coordinator &&
+		msg->state <= int(OptimizerState::Initialization) && !msg->committed && !msg->aborted)
 	{
-		neighbors_within_communication_range.insert(id);
+		// A lower-ID coordinator may supersede a round when components merge.
+		const auto& members = connected_members;
+		if(!members.empty() && msg->coordinator > members.front()) return;
+		if(optimizer_state != OptimizerState::Idle && optimizer_state < OptimizerState::End) abortOptimization(false);
+		beginRound(*msg);
 	}
-}
-
-void distributedMapping::rotationStateHandler(
-	const std_msgs::Int8ConstPtr& msg,
-	int& id)
-{
-	neighbors_rotation_estimate_finished[id] = msg->data;
-}
-
-void distributedMapping::poseStateHandler(
-	const std_msgs::Int8ConstPtr& msg,
-	int& id)
-{
-	neighbors_pose_estimate_finished[id] = msg->data;
-	neighbors_estimation_done[id] = msg->data;
+	if(!round.same(*msg)) return;
+	if(round.status.committed && msg->committed && !msg->aborted && !round.matchingCommit(*msg))
+	{
+		ROS_ERROR("Conflicting commit from %d in round %llu", id, (unsigned long long)msg->round_id);
+		abortOptimization(true);
+		return;
+	}
+	auto previous = round.peers.find(id);
+	bool progress = previous == round.peers.end() ||
+		previous->second->state != msg->state || previous->second->committed != msg->committed ||
+		previous->second->rotation_done != msg->rotation_done ||
+		previous->second->pose_done != msg->pose_done;
+	if(round.receive(id, msg) && progress) round_progress = ros::WallTime::now();
 }
 
 void distributedMapping::neighborRotationHandler(
-	const dcl_slam::neighbor_estimateConstPtr& msg,
-	int& id)
+	const dcl_slam::neighbor_estimateConstPtr& msg, int& id)
 {
-	if(msg->receiver_id != id_ || optimizer_state != OptimizerState::RotationEstimation)
-	{
-		return;
-	}
-
-	/*** prepare for optimization ***/
-	// update neighbor roatation estimates
-	for(int i = 0; i < msg->pose_id.size(); i++)
-	{
-		Symbol symbol((id + 'a'), msg->pose_id[i]);
-		if(!use_pcm_ || other_robot_keys_for_optimization.find(symbol.key()) != other_robot_keys_for_optimization.end())
-		{
-			Vector rotation_matrix(9);
-			rotation_matrix << msg->estimate[0 + 9*i], msg->estimate[1 + 9*i], msg->estimate[2 + 9*i],
-				msg->estimate[3 + 9*i], msg->estimate[4 + 9*i], msg->estimate[5 + 9*i],
-				msg->estimate[6 + 9*i], msg->estimate[7 + 9*i], msg->estimate[8 + 9*i];
-			optimizer->updateNeighborLinearizedRotations(symbol.key(), rotation_matrix);
-		}
-		else
-		{
-			ROS_DEBUG("Stop optimization<%d>. Key %d %d doesn't exist.", id_, symbol.chr(), symbol.index());
-			abortOptimization(false);
-		}
-	}
-	// update neighbor flags
-	if(optimizer_state == OptimizerState::RotationEstimation)
-	{
-		// used only with flagged initialization
-		optimizer->updateNeighboringRobotInitialized(char(id + 'a'), msg->initialized);
-		neighbors_rotation_estimate_finished[id] = msg->estimation_done;
-	}
-	ROS_DEBUG("neighborRotationHandler<%d> from robot %d done? %d (%d/%d]", id_, id, msg->estimation_done,
-		optimizer->getNeighboringRobotsInit().size(), optimization_order.size() - 1);
-
-	/*** perform rotation optimization ***/
-	// all other robot is finished rotation optimization
-	if(optimizer->getNeighboringRobotsInit().size() == optimization_order.size() - 1)
-	{
-		if(!estimation_done)
-		{
-			// rotation estimation
-			try
-			{
-				optimizer->estimateRotation();
-				optimizer->updateRotation();
-				optimizer->updateInitialized(true);
-				current_rotation_estimate_iteration++;
-			}
-			catch(const std::exception& ex)
-			{
-				ROS_WARN("Stopping rotation optimization<%d> : %s.", id_, ex.what());
-				abortOptimization(true);
-			}
-
-			// if change is small enough, end rotation optimization
-			if((optimizer->latestChange() <= rotation_estimate_change_threshold_) ||
-				(current_rotation_estimate_iteration >= optmization_maximum_iteration_))
-			{
-				rotation_estimate_finished = true;
-				estimation_done = true;
-			}
-			ROS_DEBUG("--->Rotation estimation<%d> iter:[%d/%d] change:%.4f.", id_,
-				current_rotation_estimate_iteration, optmization_maximum_iteration_, optimizer->latestChange());
-		}
-
-		// check neigbors rotation optimization state
-		bool send_flag = estimation_done;
-		for(int i = 0; i < optimization_order.size(); i++)
-		{
-			int other_robot = optimization_order[i];
-			if(!neighbors_rotation_estimate_finished[other_robot] && other_robot != id_)
-			{
-				send_flag = false;
-			}
-		}
-		// send rotation estimate to the aft-order robot
-		if(!send_flag)
-		{
-			// clear buffer
-			for(const auto& neighbor : neighbors_within_communication_range)
-			{
-				robots[neighbor].estimate_msg.pose_id.clear();
-				robots[neighbor].estimate_msg.estimate.clear();
-			}
-			// extract rotation estimate for each loop closure
-			for(const std::pair<Symbol, Symbol>& separator_symbols: optimizer->separatorsSymbols())
-			{
-				// robot id
-				int other_robot = (int)(separator_symbols.first.chr() - 'a');
-				// pose id
-				robots[other_robot].estimate_msg.pose_id.push_back(separator_symbols.second.index());
-				// rotation estimates
-				Vector rotation_estimate = optimizer->linearizedRotationAt(separator_symbols.second.key());
-				for(int it = 0; it < 9; it++)
-				{
-					robots[other_robot].estimate_msg.estimate.push_back(rotation_estimate[it]);
-				}
-			}
-			// send rotation estimate
-			int publish_flag = false;
-			for(int i = 0; i < optimization_order.size(); i++)
-			{
-				int other_robot = optimization_order[i];
-				if(other_robot == id_)
-				{
-					publish_flag = true;
-					continue;
-				}
-
-				if(publish_flag)
-				{
-					robots[other_robot].estimate_msg.initialized = optimizer->isRobotInitialized();
-					robots[other_robot].estimate_msg.receiver_id = other_robot;
-					robots[other_robot].estimate_msg.estimation_done = estimation_done;
-					robots[id_].pub_neighbor_rotation_estimates.publish(robots[other_robot].estimate_msg);
-				}
-			}
-
-			rotation_estimate_start = false;
-			optimizer->clearNeighboringRobotInit();
-		}
-		// send rotation optimization state
-		state_msg.data = estimation_done? 1:0;
-		robots[id_].pub_rotation_estimate_state.publish(state_msg);
-	}
+	receiveEstimate(msg, id, true);
 }
 
 void distributedMapping::neighborPoseHandler(
-	const dcl_slam::neighbor_estimateConstPtr& msg,
-	int& id)
+	const dcl_slam::neighbor_estimateConstPtr& msg, int& id)
 {
-	if(msg->receiver_id != id_ || optimizer_state != OptimizerState::PoseEstimation)
+	receiveEstimate(msg, id, false);
+}
+
+void distributedMapping::receiveEstimate(
+	const dcl_slam::neighbor_estimateConstPtr& msg, int id, bool rotation)
+{
+	if(!round.acceptsEstimate(id_,id,*msg)) return;
+	const size_t width = rotation ? 9 : 6;
+	if(msg->estimate.size() != width * msg->pose_id.size() ||
+		(!rotation && msg->anchor_offset.size() != 3) ||
+		msg->iteration > uint32_t(optmization_maximum_iteration_) ||
+		(msg->estimation_done && !msg->iteration) ||
+		!std::all_of(msg->estimate.begin(), msg->estimate.end(), [](float x){return std::isfinite(x);}) ||
+		!std::all_of(msg->anchor_offset.begin(), msg->anchor_offset.end(), [](float x){return std::isfinite(x);}))
 	{
+		ROS_ERROR("Invalid estimate from %d in round %llu", id, (unsigned long long)msg->round_id);
+		abortOptimization(true);
 		return;
 	}
+	auto& inbox = rotation ? rotation_inbox : pose_inbox;
+	if(round.retainEstimate(id_,id,msg,inbox)) round_progress = ros::WallTime::now();
+}
 
-	/*** prepare for optimization ***/
-	// save neighbor anchor offset
-	if(msg->estimation_done)
+void distributedMapping::publishEstimates(bool rotation, bool rebuild)
+{
+	auto& outbox = rotation ? rotation_outbox : pose_outbox;
+	if(rebuild)
 	{
-		Point3 offset(msg->anchor_offset[0], msg->anchor_offset[1], msg->anchor_offset[2]);
-		neighbors_anchor_offset[id] = offset;
-	}
-	// update neighbor pose estimates
-	for(int i = 0; i < msg->pose_id.size(); i++)
-	{
-		if(neighbors_within_communication_range.find(id) != neighbors_within_communication_range.end())
+		for(int other : round.status.participants)
 		{
-			Symbol symbol((id + 'a'), msg->pose_id[i]);
-			Vector pose_vector(6);
-			pose_vector << msg->estimate[0 + 6*i], msg->estimate[1 + 6*i], msg->estimate[2 + 6*i],
-				msg->estimate[3 + 6*i], msg->estimate[4 + 6*i], msg->estimate[5 + 6*i];
-			optimizer->updateNeighborLinearizedPoses(symbol.key(), pose_vector);
+			if(other == id_) continue;
+			auto& msg = outbox[other];
+			msg.header.stamp = ros::Time::now();
+			msg.round_id = round.status.round_id;
+			msg.receiver_id = other;
+			msg.iteration = rotation ? current_rotation_estimate_iteration : current_pose_estimate_iteration;
+			msg.initialized = msg.iteration != 0;
+			msg.estimation_done = rotation ? round.status.rotation_done : round.status.pose_done;
+			msg.pose_id.clear();
+			msg.estimate.clear();
+			msg.anchor_offset.clear();
+			for(Key key : round_send_keys[other])
+			{
+				msg.pose_id.push_back(Symbol(key).index());
+				Vector estimate = rotation ? optimizer->linearizedRotationAt(key) : optimizer->linearizedPoses().at(key);
+				for(int j = 0; j < estimate.size(); ++j) msg.estimate.push_back(estimate[j]);
+			}
+			if(!rotation)
+				for(int j = 0; j < 3; ++j) msg.anchor_offset.push_back(anchor_offset[j]);
 		}
 	}
-	// update neighbor flags
-	if(optimizer_state == OptimizerState::PoseEstimation)
+	for(int other : round.status.participants)
+		if(other != id_)
+		{
+			if(rotation) robots[id_].pub_neighbor_rotation_estimates.publish(outbox[other]);
+			else robots[id_].pub_neighbor_pose_estimates.publish(outbox[other]);
+		}
+}
+
+bool distributedMapping::applyNeighborEstimates(bool rotation, bool final_only)
+{
+	auto& inbox = rotation ? rotation_inbox : pose_inbox;
+	if(final_only && !round.finalEstimatesReady(id_,inbox)) return false;
+	optimizer->clearNeighboringRobotInit();
+	for(int other : round.status.participants)
 	{
-		// used only with flagged initialization
-		optimizer->updateNeighboringRobotInitialized(char(id + 'a'), msg->initialized);
-		neighbors_estimation_done[id] = msg->estimation_done;
-		neighbors_pose_estimate_finished[id] = msg->estimation_done;
+		if(other == id_) continue;
+		const auto& msg = *inbox.at(other);
+		const auto& expected = round_receive_keys[other];
+		if(msg.pose_id.size() != expected.size())
+			throw std::runtime_error("Committed separator payload size mismatch");
+		const size_t width = rotation ? 9 : 6;
+		for(size_t i = 0; i < expected.size(); ++i)
+		{
+			if(msg.pose_id[i] != int32_t(Symbol(expected[i]).index()))
+				throw std::runtime_error("Committed separator key mismatch");
+			Vector estimate(width);
+			for(size_t j = 0; j < width; ++j) estimate[j] = msg.estimate[width*i+j];
+			if(rotation) optimizer->updateNeighborLinearizedRotations(expected[i], estimate);
+			else optimizer->updateNeighborLinearizedPoses(expected[i], estimate);
+		}
+		optimizer->updateNeighboringRobotInitialized(char('a'+other), msg.initialized);
+		if(!rotation && msg.estimation_done)
+			neighbors_anchor_offset[other] = Point3(msg.anchor_offset[0], msg.anchor_offset[1], msg.anchor_offset[2]);
 	}
-	ROS_DEBUG("neighborPoseHandler<%d> from robot %d, done? %d [%d/%d]", id_, id, msg->estimation_done,
-		optimizer->getNeighboringRobotsInit().size(), optimization_order.size() - 1);
+	return true;
+}
 
-	/*** perform pose estimation ***/
-	if(optimizer->getNeighboringRobotsInit().size() == optimization_order.size() - 1)
+void distributedMapping::estimateStep(bool rotation)
+{
+	auto& inbox = rotation ? rotation_inbox : pose_inbox;
+	int& iteration = rotation ? current_rotation_estimate_iteration : current_pose_estimate_iteration;
+	auto& done = rotation ? round.status.rotation_done : round.status.pose_done;
+	if(done || !round.stepReady(id_, iteration, inbox)) return;
+	applyNeighborEstimates(rotation,false);
+	if(rotation) { optimizer->estimateRotation(); optimizer->updateRotation(); }
+	else { optimizer->estimatePoses(); optimizer->updatePoses(); }
+	optimizer->updateInitialized(true);
+	++iteration;
+	if(!std::isfinite(optimizer->latestChange()))
+		throw std::runtime_error("Nonfinite distributed estimate change");
+	done = iteration >= optmization_maximum_iteration_ ||
+		optimizer->latestChange() <= (rotation ? rotation_estimate_change_threshold_ : pose_estimate_change_threshold_);
+	if(!rotation)
 	{
-		if(!estimation_done)
-		{
-			// pose Estimation
-			try
-			{
-				optimizer->estimatePoses();
-				optimizer->updatePoses();
-				optimizer->updateInitialized(true);
-				current_pose_estimate_iteration++;
-			}
-			catch(const std::exception& ex)
-			{
-				ROS_WARN("Stopping pose optimization<%d> : %s.",id_,ex.what());
-				abortOptimization(true);
-			}
-
-			// if change is small enough, end pose optimization
-			if((current_pose_estimate_iteration >= optmization_maximum_iteration_) ||
-				(optimizer->latestChange() <= pose_estimate_change_threshold_))
-			{
-				pose_estimate_finished = true;
-				estimation_done = true;
-			}
-			ROS_DEBUG("--->Pose estimation<%d> iter:[%d/%d] change:%.4f.", id_,
-				current_pose_estimate_iteration, optmization_maximum_iteration_, optimizer->latestChange());
-
-			// extract anchor offset
-			Key first_key = KeyVector(initial_values->keys()).at(0);
-			anchor_point = initial_values->at<Pose3>(first_key).translation();
-			anchor_offset = anchor_point - (optimizer->currentEstimate().at<Pose3>(first_key).translation() +
-				Point3(optimizer->linearizedPoses().at(first_key).tail(3)));
-		}
-		
-		// check neigbors rotation optimization state
-		bool send_flag = estimation_done;
-		for(int i = 0; i < optimization_order.size(); i++)
-		{
-			int other_robot = optimization_order[i];
-			if(!neighbors_pose_estimate_finished[other_robot] && other_robot != id_)
-			{
-				send_flag = false;
-			}
-		}
-		// send pose estimate to the aft-order robot
-		if(!send_flag)
-		{
-			// clear buffer
-			for(const auto& neighbor : neighbors_within_communication_range)
-			{
-				robots[neighbor].estimate_msg.pose_id.clear();
-				robots[neighbor].estimate_msg.estimate.clear();
-				robots[neighbor].estimate_msg.anchor_offset.clear();
-			}
-			// extract pose estimate from each loop closure
-			for(const std::pair<Symbol, Symbol>& separator_symbols: optimizer->separatorsSymbols())
-			{
-				int other_robot = (int)(separator_symbols.first.chr() - 'a');
-
-				robots[other_robot].estimate_msg.pose_id.push_back(separator_symbols.second.index());
-
-				Vector pose_estimate = optimizer->linearizedPosesAt(separator_symbols.second.key());
-				for(int it = 0; it < 6; it++)
-				{
-					robots[other_robot].estimate_msg.estimate.push_back(pose_estimate[it]);
-				}
-			}
-			// send pose estimate
-			bool publish_flag = false;
-			for(int i = 0; i < optimization_order.size(); i++)
-			{
-				int other_robot = optimization_order[i];
-				if(other_robot == id_)
-				{
-					publish_flag = true;
-					continue;
-				}
-
-				if(publish_flag)
-				{
-					for(int i = 0; i < 3; i++)
-					{
-						robots[other_robot].estimate_msg.anchor_offset.push_back(anchor_offset.vector()[i]);
-					}
-					robots[other_robot].estimate_msg.initialized = optimizer->isRobotInitialized();
-					robots[other_robot].estimate_msg.receiver_id = other_robot;
-					robots[other_robot].estimate_msg.estimation_done = estimation_done;
-					robots[id_].pub_neighbor_pose_estimates.publish(robots[other_robot].estimate_msg);
-				}
-			}
-			// send pose optimization state
-			pose_estimate_start = false;
-			optimizer->clearNeighboringRobotInit();
-		}
-		// send optimization state
-		state_msg.data = estimation_done? 1:0;
-		robots[id_].pub_pose_estimate_state.publish(state_msg);
+		Key first = optimizer->currentEstimate().keys().front();
+		anchor_point = initial_values->at<Pose3>(first).translation();
+		anchor_offset = anchor_point - (optimizer->currentEstimate().at<Pose3>(first).translation() +
+			Point3(optimizer->linearizedPoses().at(first).tail(3)));
 	}
+	round_progress = ros::WallTime::now();
+	publishEstimates(rotation, true);
+	publishRoundState();
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * 
@@ -606,427 +462,221 @@ void distributedMapping::publishTransformation(
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * 
 	class distributedMapping: distributed mapping
 * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
-bool distributedMapping::startOptimizationCondition()
+vector<int32_t> distributedMapping::roundMembers() const
 {
-	// check if all neighbors started
-	bool all_neighbor_started = !neighbors_started_optimization.empty();
-	for(const auto& neighbor_started : neighbors_started_optimization)
+	set<int> connected{id_};
+	bool changed = true;
+	while(changed)
 	{
-		all_neighbor_started &= neighbor_started.second && (neighbor_state[neighbor_started.first] <= OptimizerState::Start);
+		changed = false;
+		for(const auto& edge : known_inter_loops)
+		{
+			int a = dcl_slam::OptimizationRound::robot(edge.first);
+			int b = dcl_slam::OptimizationRound::robot(edge.second);
+			if(connected.count(a) || connected.count(b))
+			{
+				changed |= connected.insert(a).second;
+				changed |= connected.insert(b).second;
+			}
+		}
 	}
+	return vector<int32_t>(connected.begin(), connected.end());
+}
 
-	return all_neighbor_started && sent_start_optimization_flag;
+void distributedMapping::recordInterLoop(Key a, Key b)
+{
+	if(a > b) std::swap(a,b);
+	if(Symbol(a).chr() == Symbol(b).chr()) return;
+	if(known_inter_loops.emplace(a,b).second)
+	{
+		connected_members = roundMembers();
+		sent_start_optimization_flag = true;
+	}
+}
+
+void distributedMapping::beginRound(const dcl_slam::optimization_state& proposal)
+{
+	round.begin(proposal);
+	rotation_inbox.clear();
+	pose_inbox.clear();
+	rotation_outbox.resize(number_of_robots_);
+	pose_outbox.resize(number_of_robots_);
+	round_send_keys.clear();
+	round_receive_keys.clear();
+	neighbors_anchor_offset.clear();
+	current_rotation_estimate_iteration = current_pose_estimate_iteration = 0;
+	round_graph_prepared = round_commit_applied = false;
+	round_progress = ros::WallTime::now();
+	changeOptimizerState(OptimizerState::Start);
 }
 
 void distributedMapping::updateOptimizer()
 {
-	// load subgraphs
-	graph_values_vec = std::make_pair(local_pose_graph, initial_values);
-	optimizer->loadSubgraphAndCreateSubgraphEdge(graph_values_vec);
-
-	// add prior to the first robot
-	std::pair<int, int> robot_pair = std::make_pair(id_, lowest_id_included);
-	for(const auto& neighbor_lowest_id : neighbors_lowest_id_included)
-	{
-		if(neighbors_within_communication_range.find(neighbor_lowest_id.first) != neighbors_within_communication_range.end())
-		{
-			if(neighbor_lowest_id.second < robot_pair.second)
-			{
-				robot_pair = neighbor_lowest_id;
-				if(lowest_id_to_included > neighbor_lowest_id.second)
-				{
-					lowest_id_to_included = neighbor_lowest_id.second;
-				}
-			}
-			if(neighbor_lowest_id.second == robot_pair.second)
-			{
-				if(robot_pair.first > neighbor_lowest_id.first)
-				{
-					robot_pair = neighbor_lowest_id;
-				}
-			}
-		}
-	}
-	// first robot always have prior
-	prior_owner = robot_pair.first;
-	ROS_DEBUG("priorOwner<%d> %d",id_, prior_owner);
-	if(robot_pair.first == id_)
-	{
-		static Key prior_key = Symbol('a'+id_, 0);
-		optimizer->addPrior(prior_key, robots[id_].piror_odom, prior_noise);
-		prior_added = true;
-	}
-
-	// check for graph connectivity
-	neighboring_robots = optimizer->getNeighboringChars();
-	if(neighboring_robots.size() > 0)
-	{
-		graph_disconnected = false;
-	}
-	bool has_separator_with_neighbor = false;
-	// check neighbor within communication range
-	for(const auto& neighbor : neighbors_within_communication_range)
-	{
-		if(neighboring_robots.find((char)(neighbor + 'a')) != neighboring_robots.end())
-		{
-			has_separator_with_neighbor = true;
-			neighbors_estimation_done[neighbor] = false;
-			neighbors_pose_estimate_finished[neighbor] = false;
-			neighbors_rotation_estimate_finished[neighbor] = false;
-		}
-	}
-	if(!has_separator_with_neighbor)
-	{
-		changeOptimizerState(OptimizerState::Idle);
-	}
+	// Upstream load/reinit retains neighbor caches. Start with a clean round solver.
+	optimizer.reset(new distributed_mapper::DistributedMapper(char('a'+id_)));
+	optimizer->setUseBetweenNoiseFlag(use_between_noise_);
+	optimizer->setUseLandmarksFlag(use_landmarks_);
+	optimizer->setVerbosity(distributed_mapper::DistributedMapper::ERROR);
+	optimizer->setFlaggedInit(use_flagged_init_);
+	optimizer->setUpdateType(distributed_mapper::DistributedMapper::incUpdate);
+	optimizer->setGamma(gamma_);
+	auto graph_values = std::make_pair(round_pose_graph, round_initial_values);
+	optimizer->loadSubgraphAndCreateSubgraphEdge(graph_values);
+	prior_owner = round.status.coordinator;
+	if(prior_owner == id_)
+		optimizer->addPrior(Symbol(char('a'+id_), 0), robots[id_].piror_odom, prior_noise);
+	optimizer->updateInitialized(false);
+	optimizer->clearNeighboringRobotInit();
 }
 
 void distributedMapping::outliersFiltering()
 {
-	robot_local_map_backup = robot_local_map;
-
-	if(use_pcm_)
+	measurements_accepted_num = measurements_rejected_num = 0;
+	if(!use_pcm_) return;
+	set<size_t> rejected;
+	for(int neighbor : round.status.participants)
 	{
-		measurements_accepted_num = 0;
-		measurements_rejected_num = 0;
-		// perform pairwise consistency maximization for each pair robot 
-		for(const auto& neighbor : neighbors_within_communication_range)
+		if(neighbor == id_ || !pose_estimates_from_neighbors.count(neighbor)) continue;
+		graph_utils::Transforms empty, transforms;
+		auto neighbor_info = robot_measurements::RobotLocalMap(
+			pose_estimates_from_neighbors.at(neighbor), empty, round_robot_map.getLoopClosures());
+		for(const auto& transform : round_robot_map.getTransforms().transforms)
 		{
-			if(neighbor == id_ || pose_estimates_from_neighbors.find(neighbor) == pose_estimates_from_neighbors.end())
-			{
-				continue;
-			}
-
-			// get other robot trajectory
-			graph_utils::Transforms empty_transforms;
-			auto neighbor_local_info = robot_measurements::RobotLocalMap(
-				pose_estimates_from_neighbors.at(neighbor), empty_transforms, robot_local_map.getLoopClosures());
-
-			// get inter-robot loop closure measurements
-			graph_utils::Transforms loop_closures_transforms;
-			for (const auto& transform : robot_local_map.getTransforms().transforms)
-			{
-				auto robot0 = (int) (Symbol(transform.second.i).chr()-97);
-				auto robot1 = (int) (Symbol(transform.second.j).chr()-97);
-				if(robot0 == neighbor || robot1 == neighbor)
-				{
-					loop_closures_transforms.transforms.insert(transform);
-				}
-			}
-			auto inter_robot_measurements = robot_measurements::InterRobotMeasurements(
-				loop_closures_transforms, optimizer->robotName(), (char)neighbor + 97);
-
-			// local trajectory 
-			auto local_info = robot_measurements::RobotLocalMap(
-				pose_estimates_from_neighbors.at(id_), robot_local_map.getTransforms(), robot_local_map.getLoopClosures());
-
-			// create global map
-			auto globalMap = global_map::GlobalMap(local_info, neighbor_local_info,
-				inter_robot_measurements, pcm_threshold_, use_heuristics_);
-
-			// pairwise consistency maximization
-			auto max_clique_info = globalMap.pairwiseConsistencyMaximization();
-			std::vector<int> max_clique = max_clique_info.first;
-			measurements_accepted_num += max_clique.size();
-			measurements_rejected_num += max_clique_info.second;
-
-			// retrieve indexes of rejected measurements
-			auto loopclosures_ids = optimizer->loopclosureEdge();
-			std::vector<int> rejected_loopclosure_ids;
-			rejected_loopclosure_ids.reserve(1000);
-			std::set<std::pair<Key, Key>> accepted_key_pairs, rejected_key_pairs;
-			for(int i = 0; i < loopclosures_ids.size(); i++)
-			{
-				if(distributed_pcm::DistributedPCM::isloopclosureToBeRejected(max_clique, loopclosures_ids[i],
-					loop_closures_transforms, inter_robot_measurements.getLoopClosures(), optimizer))
-				{
-					rejected_loopclosure_ids.emplace_back(i);
-
-					// Update robot local map and store keys
-					auto loopclosure_factor = boost::dynamic_pointer_cast<BetweenFactor<Pose3>>(
-						optimizer->currentGraph().at(loopclosures_ids[i]));
-					robot_local_map.removeTransform(std::make_pair(loopclosure_factor->keys().at(0), loopclosure_factor->keys().at(1)));
-					optimizer->eraseseparatorsSymbols(std::make_pair(loopclosure_factor->keys().at(0), loopclosure_factor->keys().at(1)));
-					optimizer->eraseseparatorsSymbols(std::make_pair(loopclosure_factor->keys().at(1), loopclosure_factor->keys().at(0)));
-					rejected_key_pairs.insert(std::make_pair(loopclosure_factor->keys().at(0), loopclosure_factor->keys().at(1)));
-				}
-				else
-				{
-					auto loopclosure_factor = boost::dynamic_pointer_cast<BetweenFactor<Pose3>>(
-						optimizer->currentGraph().at(loopclosures_ids[i]));
-					accepted_key_pairs.insert(std::make_pair(loopclosure_factor->keys().at(0), loopclosure_factor->keys().at(1)));
-				}
-			}
-
-			// remove measurements not in the max clique
-			int number_loopclosure_ids_removed = 0;
-			for(const auto& index : rejected_loopclosure_ids)
-			{
-				auto factor_id = loopclosures_ids[index] - number_loopclosure_ids_removed;
-				number_loopclosure_ids_removed++;
-				optimizer->eraseFactor(factor_id);
-				local_pose_graph->erase(local_pose_graph->begin()+factor_id);
-			}
-
-			// Update loopclosure ids
-			std::vector<size_t> new_loopclosure_ids;
-			new_loopclosure_ids.reserve(10000);
-			int number_of_edges = optimizer->currentGraph().size();
-			for(int i = 0; i < number_of_edges; i++)
-			{
-				auto keys = optimizer->currentGraph().at(i)->keys();
-				if(keys.size() == 2)
-				{
-					char robot0 = symbolChr(keys.at(0));
-					char robot1 = symbolChr(keys.at(1));
-					int index0 = symbolIndex(keys.at(0));
-					int index1 = symbolIndex(keys.at(1));
-					if(robot0 != robot1)
-					{
-						new_loopclosure_ids.push_back(i);
-					}
-				}
-			}
-			optimizer->setloopclosureIds(new_loopclosure_ids);
-
-			// save accepted pair
-			for(const auto& accepted_pair : accepted_key_pairs)
-			{
-				accepted_keys.insert(accepted_pair);
-				if(Symbol(accepted_pair.first).chr() == char(id_ + 'a'))
-				{
-					other_robot_keys_for_optimization.insert(accepted_pair.second);
-				}
-				else
-				{
-					other_robot_keys_for_optimization.insert(accepted_pair.first);
-				}
-			}
-			// save rejected pair
-			for(const auto& rejected_pair : rejected_key_pairs)
-			{
-				rejected_keys.insert(rejected_pair);
-			}
-
-			ROS_DEBUG("outliersFiltering<%d>, other=%d, max clique size=%d, removed=%d", id_, neighbor,
-				max_clique.size(), max_clique_info.second);
+			int a = int(Symbol(transform.second.i).chr()) - 'a';
+			int b = int(Symbol(transform.second.j).chr()) - 'a';
+			if(a == neighbor || b == neighbor) transforms.transforms.insert(transform);
 		}
+		auto measurements = robot_measurements::InterRobotMeasurements(
+			transforms, optimizer->robotName(), char('a'+neighbor));
+		auto local_info = robot_measurements::RobotLocalMap(
+			pose_estimates_from_neighbors.at(id_), round_robot_map.getTransforms(), round_robot_map.getLoopClosures());
+		auto map = global_map::GlobalMap(local_info, neighbor_info, measurements, pcm_threshold_, use_heuristics_);
+		auto clique = map.pairwiseConsistencyMaximization();
+		measurements_accepted_num += clique.first.size();
+		measurements_rejected_num += clique.second;
+		for(size_t slot : optimizer->loopclosureEdge())
+			if(distributed_pcm::DistributedPCM::isloopclosureToBeRejected(
+				clique.first, slot, transforms, measurements.getLoopClosures(), optimizer))
+				rejected.insert(slot);
 	}
-}
-
-void distributedMapping::computeOptimizationOrder()
-{
-	optimization_order.clear();
-	optimization_order.emplace_back(prior_owner);
-	std::map<int,int> edges_num;
-	auto robots_consider = neighbors_within_communication_range;
-	robots_consider.insert(id_);
-	while(true)
-	{
-		edges_num.clear();
-		for(const auto& robot0 : robots_consider)
-		{
-			if(std::find(optimization_order.begin(),optimization_order.end(),robot0) == optimization_order.end())
-			{
-				// for each robot not in the ordering, compute the number of edges
-				// towards robots inside the ordering and select the one with the largest number
-				int robot_edges_num = 0;
-				for(size_t robot1: optimization_order)
-				{
-					robot_edges_num += adjacency_matrix(robot0, robot1);
-				}
-				if(robot_edges_num != 0)
-				{
-					edges_num.insert(std::make_pair(robot0, robot_edges_num));
-				}
-			}
-		}
-		if(edges_num.empty())
-		{
-			break;
-		}
-		int maximum_edge_num = -1;
-		int maximum_robot = -1;
-		for(const auto& robot_info : edges_num)
-		{
-			if(robot_info.second > maximum_edge_num)
-			{
-				maximum_edge_num = robot_info.second;
-				maximum_robot = robot_info.first;
-			}
-		}
-		optimization_order.emplace_back(maximum_robot);
-		edges_num.erase(maximum_robot);
-	}
-
-	in_order = false;
-	for(int i = 0; i < optimization_order.size(); i++)
-	{
-		if(optimization_order[i] == id_)
-		{
-			in_order = true;
-		}
-	}
+	// Preserve factor orientation/noise; only the round snapshot is filtered.
+	for(auto it = rejected.rbegin(); it != rejected.rend(); ++it)
+		round_pose_graph->erase(round_pose_graph->begin() + *it);
 }
 
 void distributedMapping::initializePoseGraphOptimization()
 {
-	// load graph&value and check graph connectivity
+	set<pair<Key,Key>> selected;
+	for(size_t i = 0; i < round.proposal_edges.size(); i += 2)
+		selected.emplace(round.proposal_edges[i], round.proposal_edges[i+1]);
+	// Wait for every proposed incident constraint and its owned keyframe.
+	for(const auto& edge : selected)
+	{
+		for(Key key : {edge.first, edge.second})
+			if(Symbol(key).chr() == char('a'+id_) &&
+				(!known_inter_loops.count(edge) || !initial_values->exists(key))) return;
+	}
+	round_pose_graph = boost::make_shared<NonlinearFactorGraph>();
+	round_initial_values = boost::make_shared<Values>(*initial_values);
+	round_robot_map = robot_local_map;
+	for(const auto& factor : *local_pose_graph_no_filtering)
+	{
+		if(!factor || factor->keys().size() != 2) continue; // add the agreed prior once below
+		Key a = factor->keys()[0], b = factor->keys()[1];
+		if(Symbol(a).chr() != Symbol(b).chr() && !selected.count(std::minmax(a,b)))
+		{
+			round_robot_map.removeTransform(std::make_pair(a,b));
+			continue;
+		}
+		round_pose_graph->push_back(factor);
+	}
+	sent_start_optimization_flag = false;
 	updateOptimizer();
-
-	// fliter outlier with distributed PCM method
 	outliersFiltering();
-	
-	// ordering
-	computeOptimizationOrder();
-
-	// initialize
-	optimizer->updateInitialized(false);
-	optimizer->clearNeighboringRobotInit();
-	rotation_estimate_finished = false;
-	pose_estimate_finished = false;
-	estimation_done = false;
+	set<pair<Key,Key>> retained;
+	for(const auto& factor : *round_pose_graph)
+		if(factor->keys().size() == 2 && Symbol(factor->keys()[0]).chr() != Symbol(factor->keys()[1]).chr())
+			retained.insert(std::minmax(factor->keys()[0], factor->keys()[1]));
+	round.status.separator_keys.clear();
+	for(const auto& edge : retained)
+	{
+		round.status.separator_keys.push_back(edge.first);
+		round.status.separator_keys.push_back(edge.second);
+	}
+	round_graph_prepared = true;
+	ROS_INFO("Round %llu robot %d prepared, local PCM retained %zu edges",
+		(unsigned long long)round.status.round_id, id_, round.status.separator_keys.size()/2);
+	changeOptimizerState(OptimizerState::Initialization);
 }
 
-bool distributedMapping::rotationEstimationStoppingBarrier()
+bool distributedMapping::applyRoundCommit(const dcl_slam::optimization_state& commit)
 {
-	// check neighbor state
-	bool in_turn = true;
-	neighboring_robots = optimizer->getNeighboringChars();
-	for(int i = 0; i < optimization_order.size(); i++)
+	if(!round.same(commit) || !commit.committed || commit.aborted || !round_graph_prepared) return false;
+	set<pair<Key,Key>> selected;
+	for(size_t i = 0; i < commit.separator_keys.size(); i += 2)
+		selected.emplace(commit.separator_keys[i], commit.separator_keys[i+1]);
+	for(const auto& edge : selected)
 	{
-		if(optimization_order[i] != id_ &&
-			neighboring_robots.find((char)(optimization_order[i] + 'a')) != neighboring_robots.end())
+		if(Symbol(edge.first).chr() != char('a'+id_) && Symbol(edge.second).chr() != char('a'+id_)) continue;
+		bool found = false;
+		for(const auto& factor : *round_pose_graph)
+			if(factor->keys().size() == 2 &&
+				std::minmax(factor->keys()[0], factor->keys()[1]) == std::minmax(edge.first, edge.second)) found = true;
+		if(!found) throw std::runtime_error("Commit includes a locally PCM-rejected separator");
+	}
+	for(size_t i = round_pose_graph->size(); i > 0; --i)
+	{
+		const auto& keys = round_pose_graph->at(i-1)->keys();
+		if(keys.size() == 2 && Symbol(keys[0]).chr() != Symbol(keys[1]).chr() &&
+			!selected.count(std::minmax(keys[0],keys[1])))
+			round_pose_graph->erase(round_pose_graph->begin()+i-1);
+	}
+	round.status.separator_keys = commit.separator_keys;
+	round.status.order = commit.order;
+	round.status.committed = true;
+	for(const auto& edge : selected)
+	{
+		Key local = 0, remote = 0;
+		if(Symbol(edge.first).chr() == char('a'+id_)) {local=edge.first; remote=edge.second;}
+		if(Symbol(edge.second).chr() == char('a'+id_)) {local=edge.second; remote=edge.first;}
+		if(local)
 		{
-			in_turn &= (neighbor_state[optimization_order[i]] == OptimizerState::RotationEstimation);
+			int other = dcl_slam::OptimizationRound::robot(remote);
+			round_send_keys[other].push_back(local);
+			round_receive_keys[other].push_back(remote);
 		}
 	}
-	// send rotation estimate to the pre-order robot
-	if(in_turn && !rotation_estimate_start)
-	{
-		rotation_estimate_start = true;
-		// clear buffer
-		for(const auto& neighbor : neighbors_within_communication_range)
+	for(auto* table : {&round_send_keys, &round_receive_keys})
+		for(auto& entry : *table)
 		{
-			robots[neighbor].estimate_msg.pose_id.clear();
-			robots[neighbor].estimate_msg.estimate.clear();
+			auto& keys = entry.second;
+			std::sort(keys.begin(),keys.end());
+			keys.erase(std::unique(keys.begin(),keys.end()),keys.end());
 		}
-		// extract rotation estimate for each loop closure
-		for(const std::pair<Symbol, Symbol>& separator_symbols: optimizer->separatorsSymbols())
-		{
-			// robot id
-			int other_robot = (int)(separator_symbols.first.chr() - 'a');
-			// pose id
-			robots[other_robot].estimate_msg.pose_id.push_back(separator_symbols.second.index());
-			// rotation estimates
-			Vector rotation_estimate = optimizer->linearizedRotationAt(separator_symbols.second.key());
-			for(int it = 0; it < 9; it++)
-			{
-				robots[other_robot].estimate_msg.estimate.push_back(rotation_estimate[it]);
-			}
-		}
-		// send rotation estimate
-		for(int i = 0; i < optimization_order.size(); i++)
-		{
-			int other_robot = optimization_order[i];
-			if(other_robot == id_)
-			{
-				break;
-			}
-
-			robots[other_robot].estimate_msg.initialized = optimizer->isRobotInitialized();
-			robots[other_robot].estimate_msg.receiver_id = other_robot;
-			robots[other_robot].estimate_msg.estimation_done = estimation_done;
-			robots[id_].pub_neighbor_rotation_estimates.publish(robots[other_robot].estimate_msg);
-		}
-	}
-
-	// check if neighbors have begun pose estimation
-	bool all_finished_rotation_estimation = true;
-	for(const auto& neighbor : neighbors_within_communication_range)
-	{
-		all_finished_rotation_estimation &= (neighbor_state[neighbor] == OptimizerState::PoseEstimation);
-	}
-	if(all_finished_rotation_estimation)
-	{
-		return true;
-	}
-
-	// neighbors have finished rotation estimation
-	bool stop_rotation_estimation = rotation_estimate_finished;
-	for(int i = 0; i < optimization_order.size(); i++)
-	{
-		int otherRobot = optimization_order[i];
-		if(otherRobot != id_)
-		{
-			stop_rotation_estimation &= neighbors_rotation_estimate_finished[otherRobot] || 
-				neighbor_state[otherRobot] > optimizer_state;
-		}
-	}
-	return stop_rotation_estimation;
+	updateOptimizer();
+	round_commit_applied = true;
+	publishRoundState();
+	return true;
 }
 
-void distributedMapping::abortOptimization(
-	const bool& log_info)
+void distributedMapping::abortOptimization(const bool& log_info)
 {
-	for(const auto& transform : robot_local_map_backup.getTransforms().transforms)
-	{
-		if(robot_local_map.getTransforms().transforms.find(transform.first) == robot_local_map.getTransforms().transforms.end())
-		{
-			SharedNoiseModel model = noiseModel::Gaussian::Covariance(transform.second.pose.covariance_matrix);
-			auto factor = BetweenFactor<Pose3>(
-				transform.second.i, transform.second.j, transform.second.pose.pose, model);
-			robot_local_map.addTransform(factor, transform.second.pose.covariance_matrix);
-			local_pose_graph->push_back(factor);
-		}
-	}
-
+	if(log_info) ROS_WARN("Abort round %llu on robot %d", (unsigned long long)round.status.round_id, id_);
+	round.status.aborted = true;
+	sent_start_optimization_flag = true;
+	rotation_inbox.clear();
+	pose_inbox.clear();
 	changeOptimizerState(OptimizerState::Idle);
-}
-
-void distributedMapping::removeInactiveNeighbors()
-{
-	std::vector<int> removed_neighbors;
-	removed_neighbors.reserve(1000);
-	for(const auto& neighbor : neighbors_within_communication_range)
-	{
-		if(neighbor_state[neighbor] == OptimizerState::Idle)
-		{
-			removed_neighbors.emplace_back(neighbor);
-		}
-	}
-	for(const auto& neighbor : removed_neighbors)
-	{
-		neighbors_within_communication_range.erase(neighbor);;
-		neighbors_rotation_estimate_finished.erase(neighbor);
-		neighbors_pose_estimate_finished.erase(neighbor);
-		neighbors_estimation_done.erase(neighbor);
-		neighbors_lowest_id_included.erase(neighbor);
-	}
-	if(neighbors_within_communication_range.empty())
-	{
-		ROS_DEBUG("Stop optimization<%d>, there are inactive neighbors.",id_);
-		abortOptimization(false);
-	}
 }
 
 void distributedMapping::failSafeCheck()
 {
-	if(latest_change == optimizer->latestChange())
+	if(optimizer_state != OptimizerState::Idle &&
+		(ros::WallTime::now() - round_progress).toSec() > round_timeout)
 	{
-		steps_without_change++;
-	} 
-	else
-	{
-		steps_without_change = 0;
-		latest_change = optimizer->latestChange();
-	}
-
-	// wait enough time to receive data from neighbors
-	if(steps_without_change > fail_safe_steps_ * neighbors_within_communication_range.size())
-	{
-		ROS_DEBUG("No progress<%d>, Stop optimization", id_);
-		abortOptimization(false);
+		ROS_WARN("Round %llu timed out in state %d on robot %d",
+			(unsigned long long)round.status.round_id, int(optimizer_state), id_);
+		abortOptimization(true);
 	}
 }
 
@@ -1052,98 +702,9 @@ void distributedMapping::initializePoseEstimation()
 	// reset flags for flagged initialization.
 	optimizer->updateInitialized(false);
 	optimizer->clearNeighboringRobotInit();
-	estimation_done = false;
-	for(auto& neighbor_done : neighbors_estimation_done)
-	{
-		neighbor_done.second = false;
-	}
 	optimizer->resetLatestChange();
 }
 
-bool distributedMapping::poseEstimationStoppingBarrier()
-{
-	// check neighbor state
-	bool in_turn = true;
-	// neighboring_robots = optimizer->getNeighboringChars();
-	for(int i = 0; i < optimization_order.size(); i++)
-	{
-		if(optimization_order[i] != id_ && 
-			neighbors_within_communication_range.find(optimization_order[i]) != neighbors_within_communication_range.end())
-		{
-			in_turn &= (neighbor_state[optimization_order[i]] == OptimizerState::PoseEstimation);
-		}
-	}
-	// send pose estimate to the pre-order robot
-	if(in_turn && !pose_estimate_start)
-	{
-		pose_estimate_start = true;
-		// clear buffer
-		for(const auto& neighbor : neighbors_within_communication_range)
-		{
-			robots[neighbor].estimate_msg.pose_id.clear();
-			robots[neighbor].estimate_msg.estimate.clear();
-			robots[neighbor].estimate_msg.anchor_offset.clear();
-		}
-		// extract pose estimate from each loop closure
-		for(const std::pair<Symbol, Symbol>& separator_symbols: optimizer->separatorsSymbols())
-		{
-			int other_robot = (int)(separator_symbols.first.chr() - 'a');
-
-			robots[other_robot].estimate_msg.pose_id.push_back(separator_symbols.second.index());
-
-			Vector pose_estimate = optimizer->linearizedPosesAt(separator_symbols.second.key());
-			for(int it = 0; it < 6; it++)
-			{
-				robots[other_robot].estimate_msg.estimate.push_back(pose_estimate[it]);
-			}
-		}
-		// send pose estimate
-		for(int i = 0; i < optimization_order.size(); i++)
-		{
-			int other_robot = optimization_order[i];
-			if(other_robot == id_)
-			{
-				break;
-			}
-
-			for(int i = 0; i < 3; i++)
-			{
-				robots[other_robot].estimate_msg.anchor_offset.push_back(anchor_offset.vector()[i]);
-			}
-			robots[other_robot].estimate_msg.initialized = optimizer->isRobotInitialized();
-			robots[other_robot].estimate_msg.receiver_id = other_robot;
-			robots[other_robot].estimate_msg.estimation_done = pose_estimate_finished;
-			robots[id_].pub_neighbor_pose_estimates.publish(robots[other_robot].estimate_msg);
-		}
-	}
-
-	// check if others have ended optimization
-	bool all_finished_pose_estimation = true;
-	for(const auto& neighbor : neighbors_within_communication_range)
-	{
-		bool other_robot_finished = (neighbor_state[neighbor] != OptimizerState::PoseEstimation) &&
-			(neighbor_state[neighbor] != OptimizerState::PoseEstimationInitialization) &&
-			(neighbor_state[neighbor] != OptimizerState::RotationEstimation);
-		all_finished_pose_estimation &= other_robot_finished;
-	} 
-	if(all_finished_pose_estimation)
-	{
-		return true;
-	}
-
-	// neighbors have finished pose estimation
-	bool stop_pose_estimation = pose_estimate_finished;
-	for(int i = 0; i < optimization_order.size(); i++)
-	{
-		int other_robot = optimization_order[i];
-		if(other_robot != id_)
-		{
-			stop_pose_estimation &= neighbors_pose_estimate_finished[other_robot] ||
-				neighbor_state[other_robot] > optimizer_state;
-		}
-	}
-	return stop_pose_estimation;
-}
 
 void distributedMapping::updateGlobalPath(
 	const Pose3& pose)
@@ -1180,7 +741,7 @@ void distributedMapping::incrementalInitialGuessUpdate()
 			int robot0 = key0.chr();
 			int index1 = key1.index();
 			int robot1 = key1.chr();
-			if(!optimizer->currentEstimate().exists(key1) && (robot0 == robot1) && (index1 = index0 + 1))
+			if(!optimizer->currentEstimate().exists(key1) && (robot0 == robot1) && (index1 == index0 + 1))
 			{
 				// get previous pose
 				auto previous_pose = initial_values->at<Pose3>(key0);
@@ -1246,138 +807,124 @@ void distributedMapping::endOptimization()
 	// update estimates
 	incrementalInitialGuessUpdate();
 
-	lowest_id_included = lowest_id_to_included;
 }
 
-void distributedMapping::changeOptimizerState(
-	const OptimizerState& state)
+void distributedMapping::publishRoundState()
 {
-	switch(state)
-	{
-		case OptimizerState::Idle:
-			ROS_DEBUG("<%d>Idle", id_);
-			break;
-		case OptimizerState::Start:
-			ROS_DEBUG("<%d>Start", id_);
-			break;
-		case OptimizerState::Initialization:
-			ROS_DEBUG("<%d>Initialization", id_);
-			break;
-		case OptimizerState::RotationEstimation:
-			ROS_DEBUG("<%d>RotationEstimation", id_);
-			break;
-		case OptimizerState::PoseEstimationInitialization:
-			ROS_DEBUG("<%d>PoseEstimationInitialization", id_);
-			break;
-		case OptimizerState::PoseEstimation:
-			ROS_DEBUG("<%d>PoseEstimation", id_);
-			break;
-		case OptimizerState::End:
-			ROS_DEBUG("<%d>End", id_);
-			break;
-		case OptimizerState::PostEndingCommunicationDelay:
-			ROS_DEBUG("<%d>PostEndingCommunicationDelay", id_);
-			break;
-	}
+	round.status.header.stamp = ros::Time::now();
+	++round.status.header.seq;
+	round.status.state = int(optimizer_state);
+	robots[id_].pub_optimization_state.publish(round.status);
+	last_round_publish = ros::WallTime::now();
+}
 
+void distributedMapping::changeOptimizerState(const OptimizerState& state)
+{
 	optimizer_state = state;
-	state_msg.data = (int)optimizer_state;
-	robots[id_].pub_optimization_state.publish(state_msg);
+	round_progress = ros::WallTime::now();
+	ROS_INFO("Round %llu robot %d state %d committed=%d",
+		(unsigned long long)round.status.round_id, id_, int(state), int(round.status.committed));
+	publishRoundState();
 }
 
-void distributedMapping::run(
-	const ros::TimerEvent&)
+void distributedMapping::run(const ros::TimerEvent&)
 {
-	// update optimizer state
-	switch(optimizer_state)
+	try
 	{
-		case OptimizerState::Idle:
-			if(startOptimizationCondition())
+		if(round.status.aborted && optimizer_state != OptimizerState::Idle) abortOptimization(false);
+		switch(optimizer_state)
+		{
+			case OptimizerState::Idle:
 			{
-				current_rotation_estimate_iteration = 0;
-				current_pose_estimate_iteration = 0;
-				// neighbors_within_communication_range.clear();
-				neighbors_rotation_estimate_finished.clear();
-				neighbors_pose_estimate_finished.clear();
-				neighbors_anchor_offset.clear();
-				neighbors_estimation_done.clear();
-				latest_change = -1;
-				steps_without_change = 0;
-				lowest_id_to_included = lowest_id_included;
-				neighbors_started_optimization.clear();
-				if(prior_added)
+				const auto& members = connected_members;
+				if(sent_start_optimization_flag && members.size() > 1 && members.front() == id_ &&
+					(ros::WallTime::now()-round_progress).toSec() > 1.0)
 				{
-					optimizer->removePrior();
-					prior_added = false;
+					dcl_slam::optimization_state proposal;
+					proposal.round_id = std::max(ros::WallTime::now().toNSec(), round.status.round_id + 1);
+					proposal.coordinator = id_;
+					proposal.participants = members;
+					for(const auto& edge : known_inter_loops)
+						if(dcl_slam::OptimizationRound::contains(members, dcl_slam::OptimizationRound::robot(edge.first)) &&
+							dcl_slam::OptimizationRound::contains(members, dcl_slam::OptimizationRound::robot(edge.second)))
+						{
+							proposal.separator_keys.push_back(edge.first);
+							proposal.separator_keys.push_back(edge.second);
+						}
+					proposal.proposal_keys = proposal.separator_keys;
+					beginRound(proposal);
 				}
-				optimization_steps = 0;
-				changeOptimizerState(OptimizerState::Start);
+				break;
 			}
-			else
+			case OptimizerState::Start:
+				initializePoseGraphOptimization();
+				break;
+			case OptimizerState::Initialization:
 			{
-				changeOptimizerState(OptimizerState::Idle);
+				if(id_ == round.status.coordinator && !round.status.committed && round.allPrepared(id_))
+				{
+					auto commit = round.status;
+					commit.separator_keys = round.agreedEdges(id_);
+					commit.order = dcl_slam::OptimizationRound::connectedOrder(commit.participants,commit.separator_keys);
+					if(commit.order.empty()) throw std::runtime_error("PCM-consistent round graph is disconnected");
+					commit.committed = true;
+					applyRoundCommit(commit);
+				}
+				if(id_ != round.status.coordinator && !round_commit_applied)
+				{
+					auto leader = round.peers.find(round.status.coordinator);
+					if(leader != round.peers.end() && leader->second->committed) applyRoundCommit(*leader->second);
+				}
+				bool start = id_ == round.status.coordinator ? round.allCommitted(id_) : false;
+				auto leader = round.peers.find(round.status.coordinator);
+				if(id_ != round.status.coordinator && leader != round.peers.end())
+					start = round.matchingCommit(*leader->second) && leader->second->state >= int(OptimizerState::RotationEstimation);
+				if(round_commit_applied && start)
+				{
+					changeOptimizerState(OptimizerState::RotationEstimation);
+					publishEstimates(true, true);
+				}
+				break;
 			}
-			state_msg.data = (int)optimizer_state;
-			robots[id_].pub_optimization_state.publish(state_msg);
-			break;
-
-		case OptimizerState::Start:
-			initializePoseGraphOptimization();
-			optimization_steps++;
-			if(in_order)
-			{
-				changeOptimizerState(OptimizerState::Initialization);
-			}
-			else
-			{
-				changeOptimizerState(OptimizerState::Idle);
-			}
-			break;
-
-		case OptimizerState::Initialization:
-			changeOptimizerState(OptimizerState::RotationEstimation);
-			rotation_estimate_start = false;
-			optimization_steps++;
-			break;
-
-		case OptimizerState::RotationEstimation:
-			if(rotationEstimationStoppingBarrier())
-			{
-				changeOptimizerState(OptimizerState::PoseEstimationInitialization);
-			}
-			if(current_rotation_estimate_iteration > fail_safe_steps_)
-			{
-				removeInactiveNeighbors();
-			}
-			failSafeCheck();
-			optimization_steps++;
-			break;
-
-		case OptimizerState::PoseEstimationInitialization:
-			initializePoseEstimation();
-			pose_estimate_start = false;
-			optimization_steps++;
-			changeOptimizerState(OptimizerState::PoseEstimation);
-			break;
-
-		case OptimizerState::PoseEstimation:
-			if(poseEstimationStoppingBarrier())
-			{
-				changeOptimizerState(OptimizerState::End);
-			}
-			failSafeCheck();
-			optimization_steps++;
-			break;
-
-		case OptimizerState::End:
-			endOptimization();
-			changeOptimizerState(OptimizerState::PostEndingCommunicationDelay);
-			optimization_steps++;
-			break;
-
-		case OptimizerState::PostEndingCommunicationDelay:
-			changeOptimizerState(OptimizerState::Idle);
-			optimization_steps++;
-			break;
+			case OptimizerState::RotationEstimation:
+				estimateStep(true);
+				if(round.phaseDone(id_,true) && applyNeighborEstimates(true,true))
+					changeOptimizerState(OptimizerState::PoseEstimationInitialization);
+				break;
+			case OptimizerState::PoseEstimationInitialization:
+				initializePoseEstimation();
+				anchor_offset = Point3::Zero();
+				changeOptimizerState(OptimizerState::PoseEstimation);
+				publishEstimates(false,true);
+				break;
+			case OptimizerState::PoseEstimation:
+				estimateStep(false);
+				if(round.phaseDone(id_,false) && applyNeighborEstimates(false,true))
+				{
+					endOptimization();
+					changeOptimizerState(OptimizerState::End);
+				}
+				break;
+			case OptimizerState::End:
+				changeOptimizerState(OptimizerState::PostEndingCommunicationDelay);
+				break;
+			case OptimizerState::PostEndingCommunicationDelay:
+				if(round.allEnded(id_)) changeOptimizerState(OptimizerState::Idle);
+				break;
+		}
+		if((ros::WallTime::now()-last_round_publish).toSec() >= 0.25)
+		{
+			publishRoundState();
+			if(round_commit_applied && !round.status.aborted && optimizer_state >= OptimizerState::RotationEstimation)
+				publishEstimates(true);
+			if(round_commit_applied && !round.status.aborted && optimizer_state >= OptimizerState::PoseEstimation)
+				publishEstimates(false);
+		}
+		failSafeCheck();
+	}
+	catch(const std::exception& error)
+	{
+		ROS_ERROR("Round %llu robot %d failed: %s", (unsigned long long)round.status.round_id, id_, error.what());
+		abortOptimization(true);
 	}
 }

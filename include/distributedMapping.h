@@ -4,7 +4,6 @@
 #include <ros/ros.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
-#include <std_msgs/Int8.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <tf/LinearMath/Quaternion.h>
@@ -21,6 +20,7 @@
 #include "dcl_slam/loop_info.h"
 #include "dcl_slam/global_descriptor.h"
 #include "dcl_slam/neighbor_estimate.h"
+#include "optimizationRound.h"
 // pcl
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
@@ -102,16 +102,9 @@ class distributedMapping : public paramsServer
 			int& id);
 
 		void optStateHandler(
-			const std_msgs::Int8ConstPtr& msg,
+			const dcl_slam::optimization_stateConstPtr& msg,
 			int& id);
 
-		void rotationStateHandler(
-			const std_msgs::Int8ConstPtr& msg,
-			int& id);
-
-		void poseStateHandler(
-			const std_msgs::Int8ConstPtr& msg,
-			int& id);
 
 		void neighborRotationHandler(
 			const dcl_slam::neighbor_estimateConstPtr& msg,
@@ -126,28 +119,32 @@ class distributedMapping : public paramsServer
 			const Key& key,
 			const graph_utils::PoseWithCovariance& pose);
 
-		bool startOptimizationCondition();
+		vector<int32_t> roundMembers() const;
+		void recordInterLoop(Key a, Key b);
+		void beginRound(const dcl_slam::optimization_state& proposal);
+		bool applyRoundCommit(const dcl_slam::optimization_state& commit);
+		void publishRoundState();
+		void receiveEstimate(const dcl_slam::neighbor_estimateConstPtr& msg, int id, bool rotation);
+		void publishEstimates(bool rotation, bool rebuild = false);
+		void estimateStep(bool rotation);
+		bool applyNeighborEstimates(bool rotation, bool final_only);
 
 		void updateOptimizer();
 
 		void outliersFiltering();
 
-		void computeOptimizationOrder();
 
 		void initializePoseGraphOptimization();
 
-		bool rotationEstimationStoppingBarrier();
 
 		void abortOptimization(
 			const bool& log_info);
 
-		void removeInactiveNeighbors();
 
 		void failSafeCheck();
 
 		void initializePoseEstimation();
 
-		bool poseEstimationStoppingBarrier();
 
 		void updateGlobalPath(
 			const Pose3& pose_in);
@@ -208,7 +205,6 @@ class distributedMapping : public paramsServer
 		pcl::PointCloud<PointPose3D>::Ptr cloud_for_decript_ds; // input cloud for descriptor
 		deque<pair<int, dcl_slam::global_descriptor>> store_descriptors;
 
-		std_msgs::Int8 state_msg; // optimization state msg
 
 		dcl_slam::global_descriptor global_descriptor_msg; // descriptor message
 		
@@ -264,66 +260,46 @@ class distributedMapping : public paramsServer
 		ros::Timer distributed_mapping_thread; // thread for running distributed mapping
 		boost::shared_ptr<distributed_mapper::DistributedMapper> optimizer; // distributed mapper (DGS)
 
-		int steps_of_unchange_graph; // stop optimization 
 
 		// measurements
 		boost::shared_ptr<NonlinearFactorGraph> local_pose_graph; // pose graph for distributed mapping
 		boost::shared_ptr<Values> initial_values; // initial values for distributed mapping
-		GraphAndValues graph_values_vec; // vector of pose graph and initial values
-
-		bool graph_disconnected; // pose graph is not connected to others
-
-		int lowest_id_included; // lowest id in this robot
-		int lowest_id_to_included; // lowest id to be included in this robot
 		int prior_owner; // the robot that own prior factor
-		bool prior_added; // this robot have add prior factor
+		boost::shared_ptr<NonlinearFactorGraph> round_pose_graph;
+		boost::shared_ptr<Values> round_initial_values;
+		robot_measurements::RobotLocalMap round_robot_map;
 
 		gtsam::Matrix adjacency_matrix; // adjacency matrix of robot team
-		vector<int> optimization_order; // optimization order of robot team
-		bool in_order; // this robot in optimization order
+		dcl_slam::OptimizationRound round;
+		set<pair<Key, Key>> known_inter_loops;
+		vector<int32_t> connected_members;
+		map<int, dcl_slam::neighbor_estimateConstPtr> rotation_inbox, pose_inbox;
+		vector<dcl_slam::neighbor_estimate> rotation_outbox, pose_outbox;
+		map<int, vector<Key>> round_send_keys, round_receive_keys;
+		ros::WallTime round_progress, last_round_publish;
+		double round_timeout;
+		bool round_graph_prepared = false;
+		bool round_commit_applied = false;
 
 		// this robot
 		OptimizerState optimizer_state; // current state of optimizer
-		int optimization_steps; // steps in optimization
 		bool sent_start_optimization_flag; // ready for optimization
 
 		int current_rotation_estimate_iteration; // current iteration time of rotation estimate
 		int current_pose_estimate_iteration; // current iteration time of pose estimate
 
-		double latest_change; // latest change of estimate
-		int steps_without_change; // setps of estimate without change
-
-		bool rotation_estimate_start; // rotation estimate is start
-		bool pose_estimate_start; // pose estimate is start
-		bool rotation_estimate_finished; // rotation estimate is finished
-		bool pose_estimate_finished; // pose estimate is finished
-		bool estimation_done; // estimate is done
 
 		Point3 anchor_offset, anchor_point; // anchor offset
 
 		// neighbors
-		set<char> neighboring_robots; // neighbors (name) within communication range
-		set<int> neighbors_within_communication_range; // neighbors (id) within communication range
-		map<int, bool> neighbors_started_optimization; // neighbors ready for optimization
-		map<int, OptimizerState> neighbor_state; // current state of neighbors optimizer
-
-		map<int, bool> neighbors_rotation_estimate_finished; // neighbors rotation estimate is finished
-		map<int, bool> neighbors_pose_estimate_finished; // neighbors pose estimate is finished
-		map<int, bool> neighbors_estimation_done; // neighbors estimate is done
-
-		map<int, int> neighbors_lowest_id_included; // lowest id in neighbors
 		map<int, Point3> neighbors_anchor_offset; // neighbors anchor offset
 
 		// distributed pairwise consistency maximization
 		robot_measurements::RobotLocalMap robot_local_map; // local loop closures and transform 
-		robot_measurements::RobotLocalMap robot_local_map_backup; // backups in case of abort
 
 		boost::shared_ptr<NonlinearFactorGraph> local_pose_graph_no_filtering; // pose graph without pcm
 
 		map<int, graph_utils::Trajectory> pose_estimates_from_neighbors; // pose estimates of neighbors
-		set<Key> other_robot_keys_for_optimization; // keys of neighbors for optimization
-
-		set<pair<Key, Key>> accepted_keys, rejected_keys; // accepted and rejected pairs
 		int measurements_accepted_num, measurements_rejected_num;
 };
 

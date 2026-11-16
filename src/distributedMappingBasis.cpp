@@ -39,12 +39,8 @@ distributedMapping::distributedMapping() : paramsServer()
 			// enable DGS
 			if(global_optmization_enable_)
 			{
-				robot.pub_optimization_state = nh.advertise<std_msgs::Int8>(
-					robot.name_+"/distributedMapping/optimizationState", 50);
-				robot.pub_rotation_estimate_state = nh.advertise<std_msgs::Int8>(
-					robot.name_+"/distributedMapping/rotationEstimateState", 50);
-				robot.pub_pose_estimate_state = nh.advertise<std_msgs::Int8>(
-					robot.name_+"/distributedMapping/poseEstimateState", 50);
+				robot.pub_optimization_state = nh.advertise<dcl_slam::optimization_state>(
+					robot.name_+"/distributedMapping/optimizationState", 50, true);
 				robot.pub_neighbor_rotation_estimates = nh.advertise<dcl_slam::neighbor_estimate>(
 					robot.name_+"/distributedMapping/neighborRotationEstimates", 50);
 				robot.pub_neighbor_pose_estimates = nh.advertise<dcl_slam::neighbor_estimate>(
@@ -68,15 +64,9 @@ distributedMapping::distributedMapping() : paramsServer()
 
 			if(global_optmization_enable_)
 			{
-				robot.sub_optimization_state = nh.subscribe<std_msgs::Int8>(
+				robot.sub_optimization_state = nh.subscribe<dcl_slam::optimization_state>(
 					robot.name_+"/distributedMapping/optimizationState", 50,
 					boost::bind(&distributedMapping::optStateHandler, this, _1, it));
-				robot.sub_rotation_estimate_state = nh.subscribe<std_msgs::Int8>(
-					robot.name_+"/distributedMapping/rotationEstimateState", 50,
-					boost::bind(&distributedMapping::rotationStateHandler, this, _1, it));
-				robot.sub_pose_estimate_state = nh.subscribe<std_msgs::Int8>(
-					robot.name_+"/distributedMapping/poseEstimateState", 50,
-					boost::bind(&distributedMapping::poseStateHandler, this, _1, it));
 				robot.sub_neighbor_rotation_estimates = nh.subscribe<dcl_slam::neighbor_estimate>(
 					robot.name_+"/distributedMapping/neighborRotationEstimates", 50,
 					boost::bind(&distributedMapping::neighborRotationHandler, this, _1, it));
@@ -179,71 +169,33 @@ distributedMapping::distributedMapping() : paramsServer()
 	keyposes_cloud_6d.reset(new pcl::PointCloud<PointPose6D>());
 	
 	/*** distributed pose graph optmazition ***/
-	optimizer = boost::shared_ptr<distributed_mapper::DistributedMapper>(
-		new distributed_mapper::DistributedMapper(id_ + 'a'));
-
-	steps_of_unchange_graph = 0;
 
 	local_pose_graph = boost::make_shared<NonlinearFactorGraph>();
 	initial_values = boost::make_shared<Values>();
-	graph_values_vec = make_pair(local_pose_graph, initial_values);
-
-	graph_disconnected = true;
-
-	lowest_id_included = id_;
-	lowest_id_to_included = lowest_id_included;
 	prior_owner = id_;
-	prior_added = false;
 
 	adjacency_matrix = gtsam::zeros(number_of_robots_, number_of_robots_);
-	optimization_order.clear();
-	in_order = false;
 
 	optimizer_state = OptimizerState::Idle;
-	optimization_steps = 0;
 	sent_start_optimization_flag = false;
 
 	current_rotation_estimate_iteration = 0;
 	current_pose_estimate_iteration = 0;
 
-	latest_change = -1;
-	steps_without_change = 0;
+	round.status.coordinator = id_;
+	connected_members = {id_};
+	round_progress = ros::WallTime::now();
+	last_round_publish = ros::WallTime(0);
+	nh.param<double>("dcl_slam/optimization_round_timeout", round_timeout, 120.0);
 
-	rotation_estimate_start = false;
-	pose_estimate_start = false;
-	rotation_estimate_finished = false;
-	pose_estimate_finished = false;
-	estimation_done = false;
-
-	neighboring_robots.clear();
-	neighbors_within_communication_range.clear();
-	neighbors_started_optimization.clear();
-	neighbor_state.clear();
-
-	neighbors_rotation_estimate_finished.clear();
-	neighbors_pose_estimate_finished.clear();
-	neighbors_estimation_done.clear();
-
-	neighbors_lowest_id_included.clear();
 	neighbors_anchor_offset.clear();
 
 	local_pose_graph_no_filtering = boost::make_shared<NonlinearFactorGraph>();
 
 	pose_estimates_from_neighbors.clear();
-	other_robot_keys_for_optimization.clear();
-
-	accepted_keys.clear();
-	rejected_keys.clear();
 	measurements_rejected_num = 0;
 	measurements_accepted_num = 0;
 	
-	optimizer->setUseBetweenNoiseFlag(use_between_noise_); // use between noise or not in optimizePoses
-	optimizer->setUseLandmarksFlag(use_landmarks_); // use landmarks
-	optimizer->loadSubgraphAndCreateSubgraphEdge(graph_values_vec); // load subgraphs
-	optimizer->setVerbosity(distributed_mapper::DistributedMapper::ERROR); // verbosity level
-	optimizer->setFlaggedInit(use_flagged_init_);
-	optimizer->setUpdateType(distributed_mapper::DistributedMapper::incUpdate);
-	optimizer->setGamma(gamma_);
 
 	if(global_optmization_enable_)
 	{
