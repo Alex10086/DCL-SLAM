@@ -96,6 +96,7 @@ void distributedMapping::publishEstimates(bool rotation, bool rebuild)
 			msg.receiver_id = other;
 			msg.iteration = rotation ? current_rotation_estimate_iteration : current_pose_estimate_iteration;
 			msg.initialized = msg.iteration != 0;
+			msg.local_converged = rotation ? rotation_local_converged : pose_local_converged;
 			msg.estimation_done = rotation ? round.status.rotation_done : round.status.pose_done;
 			msg.pose_id.clear();
 			msg.estimate.clear();
@@ -152,7 +153,18 @@ void distributedMapping::estimateStep(bool rotation)
 	auto& inbox = rotation ? rotation_inbox : pose_inbox;
 	int& iteration = rotation ? current_rotation_estimate_iteration : current_pose_estimate_iteration;
 	auto& done = rotation ? round.status.rotation_done : round.status.pose_done;
-	if(done || !round.stepReady(id_, iteration, inbox)) return;
+	auto& local_converged = rotation ? rotation_local_converged : pose_local_converged;
+	if(done) return;
+	if(iteration > 0 && round.allConvergedAt(id_, uint32_t(iteration), local_converged,
+		uint32_t(optmization_maximum_iteration_), inbox))
+	{
+		done = true;
+		round_progress = ros::WallTime::now();
+		publishEstimates(rotation, true);
+		publishRoundState();
+		return;
+	}
+	if(!round.stepReady(id_, iteration, inbox)) return;
 	applyNeighborEstimates(rotation,false);
 	if(rotation) { optimizer->estimateRotation(); optimizer->updateRotation(); }
 	else { optimizer->estimatePoses(); optimizer->updatePoses(); }
@@ -160,8 +172,16 @@ void distributedMapping::estimateStep(bool rotation)
 	++iteration;
 	if(!std::isfinite(optimizer->latestChange()))
 		throw std::runtime_error("Nonfinite distributed estimate change");
-	done = iteration >= optmization_maximum_iteration_ ||
-		optimizer->latestChange() <= (rotation ? rotation_estimate_change_threshold_ : pose_estimate_change_threshold_);
+	const double threshold = rotation ? rotation_estimate_change_threshold_ : pose_estimate_change_threshold_;
+	const int min_sweeps = std::min(2, optmization_maximum_iteration_);
+	local_converged = iteration >= min_sweeps && optimizer->latestChange() <= threshold;
+	const bool global_converged = round.allConvergedAt(id_, uint32_t(iteration), local_converged,
+		uint32_t(optmization_maximum_iteration_), inbox);
+	done = global_converged || iteration >= optmization_maximum_iteration_;
+	if(done)
+		ROS_INFO("Round %llu robot %d %s finished at iter %d (reason=%s, latestChange=%.3e)",
+			(unsigned long long)round.status.round_id, id_, rotation ? "rotation" : "pose",
+			iteration, global_converged ? "converged" : "max_iter", optimizer->latestChange());
 	if(!rotation)
 	{
 		Key first = optimizer->currentEstimate().keys().front();
@@ -506,6 +526,7 @@ void distributedMapping::beginRound(const dcl_slam::optimization_state& proposal
 	neighbors_anchor_offset.clear();
 	current_rotation_estimate_iteration = current_pose_estimate_iteration = 0;
 	round_graph_prepared = round_commit_applied = false;
+	rotation_local_converged = pose_local_converged = false;
 	round_progress = ros::WallTime::now();
 	changeOptimizerState(OptimizerState::Start);
 }
@@ -703,6 +724,7 @@ void distributedMapping::initializePoseEstimation()
 	optimizer->updateInitialized(false);
 	optimizer->clearNeighboringRobotInit();
 	optimizer->resetLatestChange();
+	pose_local_converged = false;
 }
 
 

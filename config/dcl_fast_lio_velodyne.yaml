@@ -20,7 +20,7 @@ dcl_slam: {
   # mapping
   global_optmization_enable: true,        # enable distributed DGS
   use_between_noise: true,                # use between noise flag
-  optmization_maximum_iteration: 30,      # maximum iterations time of optimization
+  optmization_maximum_iteration: 100,      # maximum iterations time of optimization
   use_pcm: false,                         # enable pairwise consistency maximization (with descriptor_distance_threshold=0.5)
   pcm_threshold: 0.5,                     # confidence probability for PCM (i.e., 0.01, 0.05, 0.1, 0.25, 0.5, 0.75)
 

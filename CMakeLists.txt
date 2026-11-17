@@ -96,3 +96,7 @@ target_link_libraries(dcl_slam ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIB
 add_executable(dcl_round_protocol_test EXCLUDE_FROM_ALL reproduction/tests/round_protocol_test.cpp)
 add_dependencies(dcl_round_protocol_test ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(dcl_round_protocol_test ${catkin_LIBRARIES})
+
+add_executable(dcl_dgs_numeric_test EXCLUDE_FROM_ALL reproduction/tests/dgs_numeric_test.cpp)
+add_dependencies(dcl_dgs_numeric_test ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(dcl_dgs_numeric_test ${catkin_LIBRARIES})

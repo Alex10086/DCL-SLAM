@@ -6,6 +6,7 @@ uint32 iteration
 int8 receiver_id
 int8 estimation_done
 int8 initialized
+int8 local_converged
 
 float32[] anchor_offset
 

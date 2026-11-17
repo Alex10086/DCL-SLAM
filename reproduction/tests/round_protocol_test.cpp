@@ -61,12 +61,14 @@ struct Team {
         for (int id = 0; id < 3; ++id) send(id);
     }
 };
-static neighbor_estimateConstPtr packet(uint64_t round, int receiver, uint32_t iteration, bool done = false) {
+static neighbor_estimateConstPtr packet(uint64_t round, int receiver, uint32_t iteration,
+                                       bool done = false, bool local_converged = false) {
     auto p = boost::make_shared<neighbor_estimate>();
     p->round_id = round;
     p->receiver_id = receiver;
     p->iteration = iteration;
     p->estimation_done = done;
+    p->local_converged = local_converged;
     p->initialized = iteration != 0;
     p->anchor_offset = {1,2,3};
     return p;
@@ -127,9 +129,19 @@ static void ordered_sweeps_and_early_packets() {
     require(!b.retainEstimate(1,0,packet(700,2,90,true),inbox), "another receiver's packet must not be consumed");
     require(!b.retainEstimate(1,0,packet(700,1,0),inbox), "out-of-order iteration must not roll cache backward");
     require(inbox.at(0)->iteration == 1, "early update was lost after stale packet");
-    b.retainEstimate(1,0,packet(700,1,2,true),inbox);
-    b.retainEstimate(1,2,packet(700,1,1,true),inbox);
-    require(b.stepReady(1,20,inbox), "frozen final neighbors must not block later local sweeps");
+    require(!b.allConvergedAt(1,1,true,30,inbox), "single sweep must not trigger global convergence");
+    b.retainEstimate(1,0,packet(700,1,2,false,true),inbox);
+    b.retainEstimate(1,2,packet(700,1,2,false,false),inbox);
+    require(!b.allConvergedAt(1,2,true,30,inbox), "unconverged C must keep team running sweep 3");
+    require(b.retainEstimate(1,2,packet(700,1,2,true,true),inbox),
+            "same-iteration transition to estimation_done must be retained");
+    require(b.allConvergedAt(1,2,true,30,inbox), "coherent converged team at sweep 2 must stop");
+    require(!b.retainEstimate(1,2,packet(700,1,2,false,true),inbox),
+            "estimation_done must not regress at same iteration");
+    b.retainEstimate(1,0,packet(700,1,30,true,false),inbox);
+    b.retainEstimate(1,2,packet(700,1,30,true,true),inbox);
+    require(!b.allConvergedAt(1,30,true,30,inbox),
+            "max_iter estimation_done without local_converged must not count as convergence");
 }
 static void final_payload_and_phase_barriers() {
     Team t; t.commit();

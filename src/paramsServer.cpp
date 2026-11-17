@@ -56,8 +56,8 @@ paramsServer::paramsServer()
 	nh.param<int>(ns + "/optmization_maximum_iteration", optmization_maximum_iteration_, 100);
 	nh.param<float>(ns + "/failsafe_wait_time", fail_safe_wait_time_, 1.0);
 	fail_safe_steps_ = fail_safe_wait_time_/mapping_process_interval_;
-	nh.param<float>(ns + "/rotation_estimate_change_threshold", rotation_estimate_change_threshold_, 0.1);
-	nh.param<float>(ns + "/pose_estimate_change_threshold", pose_estimate_change_threshold_, 0.1);
+	nh.param<float>(ns + "/rotation_estimate_change_threshold", rotation_estimate_change_threshold_, 1e-3);
+	nh.param<float>(ns + "/pose_estimate_change_threshold", pose_estimate_change_threshold_, 1e-3);
 	nh.param<float>(ns + "/gamma", gamma_, 1.0);
 	nh.param<bool>(ns + "/use_flagged_init", use_flagged_init_, true);
 	nh.param<bool>(ns + "/use_landmarks", use_landmarks_, false);

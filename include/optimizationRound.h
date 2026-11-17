@@ -151,7 +151,7 @@ public:
             auto p = inbox.find(id);
             if (p == inbox.end() || p->second->round_id != status.round_id) return false;
             const uint32_t needed = iteration + (before ? 1 : 0);
-            if (!p->second->estimation_done && p->second->iteration < needed) return false;
+            if (p->second->iteration < needed) return false;
         }
         return status.committed && !status.aborted;
     }
@@ -163,8 +163,25 @@ public:
                         std::map<int, neighbor_estimateConstPtr>& inbox) const {
         if (!acceptsEstimate(self,sender,*msg)) return false;
         auto old = inbox.find(sender);
-        if (old != inbox.end() && old->second->iteration >= msg->iteration) return false;
+        if (old != inbox.end()) {
+            if (msg->iteration < old->second->iteration) return false;
+            if (msg->iteration == old->second->iteration &&
+                (old->second->estimation_done || !msg->estimation_done)) return false;
+        }
         inbox[sender] = msg;
+        return true;
+    }
+    bool allConvergedAt(int self, uint32_t iteration, bool local_converged, uint32_t max_iterations,
+                        const std::map<int, neighbor_estimateConstPtr>& inbox) const {
+        const uint32_t min_sweeps = max_iterations < 2 ? max_iterations : 2u;
+        if (!status.committed || status.aborted || !iteration || iteration < min_sweeps || !local_converged)
+            return false;
+        for (int id : status.participants) if (id != self) {
+            auto p = inbox.find(id);
+            if (p == inbox.end() || !acceptsEstimate(self, id, *p->second)) return false;
+            if (p->second->iteration != iteration) return false;
+            if (!p->second->local_converged) return false;
+        }
         return true;
     }
     bool finalEstimatesReady(int self, const std::map<int, neighbor_estimateConstPtr>& inbox) const {

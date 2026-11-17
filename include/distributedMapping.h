@@ -280,6 +280,8 @@ class distributedMapping : public paramsServer
 		double round_timeout;
 		bool round_graph_prepared = false;
 		bool round_commit_applied = false;
+		bool rotation_local_converged = false;
+		bool pose_local_converged = false;
 
 		// this robot
 		OptimizerState optimizer_state; // current state of optimizer
